@@ -19,7 +19,7 @@
  */
 
 const APP_VERSION = "v2.0.3";
-
+const EXCHANGE_RATE_API_URL = 'https://api.frankfurter.dev/v1/latest?base=';
 // ==========================================
 // 1. Core Logic (Lunar & Calc)
 // ==========================================
@@ -3233,7 +3233,7 @@ const HTML = `<!DOCTYPE html>
                     if (!baseCurrency) baseCurrency = 'CNY';
                     ratesLoading.value = true;
                     try {
-                        const res = await fetch('https://api.frankfurter.dev/v1/latest?base=' + baseCurrency);
+                        const res = await fetch('${EXCHANGE_RATE_API_URL}'+baseCurrency);
                         if (res.ok) {
                             const data = await res.json();
                             exchangeRates.value = { ...data.rates, [baseCurrency]: 1 };
