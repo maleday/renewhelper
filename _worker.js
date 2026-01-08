@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: RenewHelper (v1.4.3)
+ * Cloudflare Worker: RenewHelper (v2.0.0)
  * Author: LOSTFREE
  * Features: Multi-Channel Notify, Import/Export, Channel Test, Bilingual UI, Precise ICS Alarm
  * added: sort, filter v1.3.4
@@ -12,10 +12,27 @@
  * modified: mobile layout v1.4.1
  * modified: add gotify/ntfy channels and refactor setup page v1.4.2
  * modified: fix previewDate logic v1.4.3
+ * added: add billing management v2.0.0
+ * modified: fix manual renew v2.0.1
+ * added: add manual renew history v2.0.2
+ * modified: fix renewDialogVisible logic v2.0.3
+ * added: add exchange rate v2.0.4
+ * modified: add cache optimize exchange rate logic v2.0.5
+ * added: add total amount display v2.0.6
+ * added: add filter logic v2.0.7
+ * added: add spending stats v2.0.8
+ * modified: fix spending stats logic v2.0.9
+ * added: add avg monthly label v2.0.10
+ * added: add monthly breakdown v2.0.11
+ * modified: fix spending stats logic v2.0.12
+ * added: add upcoming bills total v2.0.13
+ * added: add upcoming bills days config v2.0.14
+ * added: add icon and custom push title config v2.0.15
  */
 
-const APP_VERSION = "v1.4.3";
-
+const APP_VERSION = "v2.0.15";
+//接入免费汇率API
+const EXCHANGE_RATE_API_URL = 'https://api.frankfurter.dev/v1/latest?base=';
 // ==========================================
 // 1. Core Logic (Lunar & Calc)
 // ==========================================
@@ -362,6 +379,7 @@ const DataStore = {
       autoDisableDays: 30,
       language: "zh",
       timezone: "UTC",
+      defaultCurrency: "CNY",
       jwtSecret: "",
       calendarToken: "",
       enabledChannels: [],
@@ -443,7 +461,7 @@ const DataStore = {
     };
 
     // 3. 写入 KV
-    await env.RENEW_KV.put(this.KEYS.ITEMS, JSON.stringify(storageObj));
+    await env.RENEW_KV.put(this.KEYS.ITEMS, JSON.stringify(storageObj, null, 2));
     return newVersion;
   },
 
@@ -531,7 +549,7 @@ const Calc = {
   parseYMD(s) {
     if (!s) return new Date();
     const p = s.split("-");
-    return new Date(Date.UTC(+p[0], +p[1] - 1, +p[2]));
+    return new Date(Date.UTC(+p[0], +p[1] - 1, parseInt(p[2])));
   },
   toYMD(d) {
     return d.toISOString().split("T")[0];
@@ -738,36 +756,55 @@ async function webhookAdapterImpl(c, title, body) {
 // ==========================================
 
 function calculateStatus(item, timezone = "UTC") {
-  // 使用时区感知的“今天”，而不是 UTC 的今天
+  // 使用时区感知的“今天”
   const today = Calc.getTzToday(timezone);
 
   const cDate = item.createDate || Calc.toYMD(today),
     rDate = item.lastRenewDate || cDate;
   const interval = Number(item.intervalDays),
     unit = item.cycleUnit || "day";
-  const rObj = Calc.parseYMD(rDate);
+
   let nextObj;
 
-  if (item.useLunar) {
-    let l = LUNAR_DATA.solar2lunar(
-      rObj.getUTCFullYear(),
-      rObj.getUTCMonth() + 1,
-      rObj.getUTCDate()
-    );
-    if (l) {
-      let nl = calcBiz.addPeriod(l, interval, unit);
-      let s = calcBiz.l2s(nl);
-      nextObj = new Date(Date.UTC(s.year, s.month - 1, s.day));
-    } else nextObj = new Date(rObj);
+  // ============================================================
+  // 新逻辑: 优先使用续费历史中的 EndDate 作为下次到期日
+  // ============================================================
+  const hasHistory = Array.isArray(item.renewHistory) && item.renewHistory.length > 0 && item.renewHistory[0].endDate;
+
+  if (hasHistory) {
+    // 直接取最新一条历史记录的 endDate
+    nextObj = Calc.parseYMD(item.renewHistory[0].endDate);
+
+    // 如果开启了农历，仍需处理农历转换以便显示
+    // 但 nextObj 本身已经确定，不需要再做加减运算
   } else {
-    nextObj = new Date(rObj);
-    if (unit === "year")
-      nextObj.setUTCFullYear(nextObj.getUTCFullYear() + interval);
-    else if (unit === "month")
-      nextObj.setUTCMonth(nextObj.getUTCMonth() + interval);
-    else nextObj.setUTCDate(nextObj.getUTCDate() + interval);
+    // ============================================================
+    // 原逻辑: 根据 lastRenewDate + 周期 动态推算
+    // ============================================================
+    const rObj = Calc.parseYMD(rDate);
+
+    if (item.useLunar) {
+      let l = LUNAR_DATA.solar2lunar(
+        rObj.getUTCFullYear(),
+        rObj.getUTCMonth() + 1,
+        rObj.getUTCDate()
+      );
+      if (l) {
+        let nl = calcBiz.addPeriod(l, interval, unit);
+        let s = calcBiz.l2s(nl);
+        nextObj = new Date(Date.UTC(s.year, s.month - 1, s.day));
+      } else nextObj = new Date(rObj);
+    } else {
+      nextObj = new Date(rObj);
+      if (unit === "year")
+        nextObj.setUTCFullYear(nextObj.getUTCFullYear() + interval);
+      else if (unit === "month")
+        nextObj.setUTCMonth(nextObj.getUTCMonth() + interval);
+      else nextObj.setUTCDate(nextObj.getUTCDate() + interval);
+    }
   }
 
+  // 计算农历显示字符串
   let lNext = "",
     lLast = "";
   if (item.useLunar) {
@@ -777,10 +814,13 @@ function calculateStatus(item, timezone = "UTC") {
       nextObj.getUTCDate()
     );
     if (ln) lNext = ln.fullStr;
+
+    // 如果是历史记录模式，rObj 可能已经不重要了，但为了兼容显示仍计算一下
+    const rObjForLunar = Calc.parseYMD(rDate);
     const ll = LUNAR_DATA.solar2lunar(
-      rObj.getUTCFullYear(),
-      rObj.getUTCMonth() + 1,
-      rObj.getUTCDate()
+      rObjForLunar.getUTCFullYear(),
+      rObjForLunar.getUTCMonth() + 1,
+      rObjForLunar.getUTCDate()
     );
     if (ll) lLast = ll.fullStr;
   }
@@ -868,8 +908,8 @@ async function checkAndRenew(env, isSched, lang = "zh") {
   ]);
 
   const s = conf;
-  const items = pkg.items; // 获取 items 数组
-  const currentVersion = pkg.version; // 获取读取时的版本号
+  const items = pkg.items;
+  const currentVersion = pkg.version;
 
   const logs = [],
     log = (m) => {
@@ -887,8 +927,9 @@ async function checkAndRenew(env, isSched, lang = "zh") {
 
   // 1. 获取基于偏好时区的“今天”
   const today = Calc.getTzToday(s.timezone);
+  const todayStr = Calc.toYMD(today);
 
-  // 2. 获取基于偏好时区的“当前时:分” (修复 Docker 环境兼容性)
+  // 2. 获取当前时间 (用于 Cron 定时通知的时间比对)
   let nowH = 0, nowM = 0;
   try {
     const fmt = new Intl.DateTimeFormat("en-US", {
@@ -904,10 +945,7 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     };
     nowH = find("hour");
     nowM = find("minute");
-
-  } catch (e) {
-    log(`[ERR] Time calc failed: ${e.message}`);
-  }
+  } catch (e) { }
 
   for (let i = 0; i < items.length; i++) {
     let it = items[i];
@@ -920,11 +958,12 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     const msg = it.message ? ` (${t("note", lang)}: ${it.message})` : "";
 
     const iAutoRenew = it.autoRenew !== false;
-    const iRenewDays =
-      typeof it.autoRenewDays === "number" ? it.autoRenewDays : 3;
+    const iRenewDays = typeof it.autoRenewDays === "number" ? it.autoRenewDays : 3;
     const iNotifyDays = typeof it.notifyDays === "number" ? it.notifyDays : 3;
 
-    // --- 逻辑 A: 自动禁用 ---
+    // ============================================================
+    // 逻辑 A: 自动禁用 (Auto Disable)
+    // ============================================================
     if (!iAutoRenew && days <= -Math.abs(s.autoDisableDays)) {
       log(t("autoDisable", lang, it.name, Math.abs(days), s.autoDisableDays));
       it.enabled = false;
@@ -938,96 +977,95 @@ async function checkAndRenew(env, isSched, lang = "zh") {
       changed = true;
       continue;
     }
-    // --- 逻辑 B: 自动续期 ---
+    // ============================================================
+    // 逻辑 B: 自动续期 (Auto Renew)
+    // ============================================================
     else if (iAutoRenew && days <= -Math.abs(iRenewDays)) {
       log(t("autoRenew", lang, it.name));
-      const rObj = Calc.parseYMD(it.lastRenewDate),
-        unit = it.cycleUnit || "day",
-        intv = Number(it.intervalDays);
 
-      // 防止死循环保护
-      // 防止 intervalDays 为 0 或负数导致死循环，耗尽 Worker CPU 资源
-      let loopSafe = 0;
-      const MAX_LOOPS = 300; // 限制最大推算次数（300个周期通常足够覆盖数年）
+      // 1. 准备操作时间 (使用用户偏好时区)
+      // 原逻辑: const opTimeStr = new Date().toISOString().replace('T', ' ').split('.')[0]; (UTC)
+      // 新逻辑: 使用 s.timezone 格式化为 YYYY-MM-DD HH:mm:ss
+      let opTimeStr;
+      try {
+        const tz = s.timezone || 'UTC';
+        // en-CA 格式化结果通常为 "YYYY-MM-DD, HH:mm:ss"
+        const fmt = new Intl.DateTimeFormat('en-CA', {
+          timeZone: tz,
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit',
+          hour12: false
+        });
+        opTimeStr = fmt.format(new Date()).replace(', ', ' ');
+      } catch (e) {
+        // 如果时区无效，回退到 UTC
+        opTimeStr = new Date().toISOString().replace('T', ' ').split('.')[0];
+      }
 
-      let currentRenew = new Date(rObj);
+      // 2. 确定“账单起始日” (Start Date) - 与手动逻辑保持一致
+      // st.nextDueDate 即为“理论上的当前周期结束日”，也是“下一周期的开始日”
+      let startStr = todayStr; // 默认为今天 (Reset模式 或 Cycle已过期模式)
+
+      if (it.type !== 'reset') {
+        // Cycle 模式
+        // 如果还没有过期 (nextDueDate > today)，则无缝衔接
+        // 如果已经过期 (nextDueDate <= today)，则从今天开始 (跳过空白期)
+        if (st.nextDueDate > todayStr) {
+          startStr = st.nextDueDate;
+        }
+      }
+
+      // 3. 计算“账单结束日” (End Date)
+      let endStr = startStr;
+      const intv = Number(it.intervalDays);
+      const unit = it.cycleUnit || 'day';
+      const sDate = Calc.parseYMD(startStr);
 
       if (it.useLunar) {
-        let l = LUNAR_DATA.solar2lunar(
-          rObj.getUTCFullYear(),
-          rObj.getUTCMonth() + 1,
-          rObj.getUTCDate()
-        );
-        // 增加 l 对象的非空校验，防止农历转换失败导致 crash
-        if (!l) {
-          log(`[ERR] Lunar conversion failed for ${it.name}`);
-        } else {
-          while (true) {
-            // 1. 安全中断检测
-            if (++loopSafe > MAX_LOOPS) {
-              log(
-                `[WARN] Loop Limit Exceeded for item: ${it.name} (Check interval/date settings)`
-              );
-              break;
-            }
-
-            let nextL = calcBiz.addPeriod(l, intv, unit);
-            let sol = calcBiz.l2s(nextL);
-
-            // 2. 防止农历逆向转换失败
-            if (!sol) {
-              log(`[ERR] Lunar reverse calc failed for ${it.name}`);
-              break;
-            }
-
-            let nextTime = new Date(Date.UTC(sol.year, sol.month - 1, sol.day));
-            if (nextTime > today) break;
-            currentRenew = nextTime;
-            l = nextL;
-          }
+        const l = LUNAR_DATA.solar2lunar(sDate.getUTCFullYear(), sDate.getUTCMonth() + 1, sDate.getUTCDate());
+        if (l) {
+          const nextL = calcBiz.addPeriod(l, intv, unit);
+          const nextS = calcBiz.l2s(nextL);
+          endStr = `${nextS.year}-${nextS.month.toString().padStart(2, '0')}-${nextS.day.toString().padStart(2, '0')}`;
         }
       } else {
-        while (true) {
-          // 1. 安全中断检测
-          if (++loopSafe > MAX_LOOPS) {
-            log(
-              `[WARN] Loop Limit Exceeded for item: ${it.name} (Check interval/date settings)`
-            );
-            break;
-          }
-
-          let nextCandidate = new Date(currentRenew);
-          if (unit === "year")
-            nextCandidate.setUTCFullYear(nextCandidate.getUTCFullYear() + intv);
-          else if (unit === "month")
-            nextCandidate.setUTCMonth(nextCandidate.getUTCMonth() + intv);
-          else nextCandidate.setUTCDate(nextCandidate.getUTCDate() + intv);
-
-          // 2. 防止日期未发生变化（如 interval=0）导致的死循环
-          if (nextCandidate.getTime() <= currentRenew.getTime()) {
-            log(`[ERR] Interval too small or zero for ${it.name}`);
-            break;
-          }
-
-          if (nextCandidate > today) break;
-          currentRenew = nextCandidate;
-        }
+        const d = new Date(sDate);
+        if (unit === 'year') d.setUTCFullYear(d.getUTCFullYear() + intv);
+        else if (unit === 'month') d.setUTCMonth(d.getUTCMonth() + intv);
+        else d.setUTCDate(d.getUTCDate() + intv);
+        endStr = Calc.toYMD(d);
       }
 
-      const newD = Calc.toYMD(currentRenew);
-      if (newD !== it.lastRenewDate) {
-        upd.push({
-          name: it.name,
-          old: it.lastRenewDate,
-          new: newD,
-          note: msg,
-        });
-        it.lastRenewDate = newD;
-        items[i] = it;
-        changed = true;
-      }
+      // 4. 更新服务数据
+      const oldLastRenew = it.lastRenewDate;
+      it.lastRenewDate = todayStr; // “上次续费”更新为操作时间(今天)
+
+      // 5. 写入历史记录 (Renew History)
+      const historyItem = {
+        renewDate: opTimeStr, // 这里现在是带时区的时间了
+        startDate: startStr,
+        endDate: endStr,
+        price: it.fixedPrice || 0,
+        currency: it.currency || 'CNY',
+        note: 'Auto Renew'
+      };
+
+      if (!Array.isArray(it.renewHistory)) it.renewHistory = [];
+      it.renewHistory.unshift(historyItem); // 插入到最前面
+
+      // 6. 记录日志
+      upd.push({
+        name: it.name,
+        old: oldLastRenew,
+        new: todayStr,
+        note: msg,
+      });
+      items[i] = it;
+      changed = true;
     }
-    // --- 逻辑 C: 到期提醒 & 状态记录 ---
+    // ============================================================
+    // 逻辑 C: 到期提醒 (Notify)
+    // ============================================================
     else if (days <= iNotifyDays) {
       const statusText =
         days === 0
@@ -1046,10 +1084,12 @@ async function checkAndRenew(env, isSched, lang = "zh") {
 
       let shouldPush = true;
       if (isSched) {
+        // 定时任务运行时，检查是否到达指定的推送时间 (notifyTime)
         const nTime = it.notifyTime || "08:00";
         const [tgtH, tgtM] = nTime.split(":").map(Number);
         const diffMinutes = Math.abs(nowH * 60 + nowM - (tgtH * 60 + tgtM));
 
+        // 只有在设定时间前后 5分钟内才推送
         if (diffMinutes > 5) {
           shouldPush = false;
         }
@@ -1058,7 +1098,6 @@ async function checkAndRenew(env, isSched, lang = "zh") {
       if (shouldPush) {
         trig.push({ ...st, note: msg });
       } else {
-        // 虽然不推送，但记入 monitor 列表，确保触发日志保存
         monitor.push({ ...st });
       }
     } else {
@@ -1067,37 +1106,28 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     }
   }
 
-  // 【修改】保存逻辑
+  // 保存变更
   if (changed) {
     try {
-      // 尝试保存，带上读取时的版本号
       await DataStore.saveItems(env, items, currentVersion);
       log(`[SYSTEM] Data saved successfully.`);
     } catch (e) {
       if (e.message === "VERSION_CONFLICT") {
-        // 如果冲突，Cron 任务选择放弃，不覆盖数据，等待下次运行
-        log(
-          `[WARN] Data conflict detected during cron. Skipping save to protect data.`
-        );
-        // 重要：如果保存失败，不应该发送“已续期”的通知，因为实际上没存进去
-        // 清空 upd 和 dis 数组，避免后续发通知误导
-        upd = [];
-        dis = [];
+        log(`[WARN] Data conflict detected during cron. Skipping save to protect data.`);
+        upd = []; dis = []; // 避免发送误导性通知
       } else {
         log(`[ERR] Save failed: ${e.message}`);
       }
     }
   }
 
+  // 推送通知逻辑
   if (s.enableNotify) {
     let pushBody = [];
     if (dis.length) {
       pushBody.push(`【${t("secDis", lang)}】`);
       dis.forEach((x, i) =>
-        pushBody.push(
-          `${i + 1}. ${x.name} (${t("overdue", lang, Math.abs(x.daysLeft))} / ${x.nextDueDate
-          })\n${x.note}`
-        )
+        pushBody.push(`${i + 1}. ${x.name} (${t("overdue", lang, Math.abs(x.daysLeft))} / ${x.nextDueDate})\n${x.note}`)
       );
       pushBody.push("");
     }
@@ -1111,21 +1141,14 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     if (trig.length) {
       pushBody.push(`【${t("secAle", lang)}】`);
       trig.forEach((x, i) => {
-        const dayStr =
-          x.daysLeft === 0
-            ? t("today", lang)
-            : x.daysLeft < 0
-              ? t("overdue", lang, Math.abs(x.daysLeft))
-              : t("left", lang, x.daysLeft);
-        pushBody.push(
-          `${i + 1}. ${x.name}: ${dayStr} (${x.nextDueDate})\n${x.note}`
-        );
+        const dayStr = x.daysLeft === 0 ? t("today", lang) : (x.daysLeft < 0 ? t("overdue", lang, Math.abs(x.daysLeft)) : t("left", lang, x.daysLeft));
+        pushBody.push(`${i + 1}. ${x.name}: ${dayStr} (${x.nextDueDate})\n${x.note}`);
       });
     }
 
     if (pushBody.length > 0) {
       const fullBody = pushBody.join("\n").trim();
-      const pushRes = await Notifier.send(s, t("pushTitle", lang), fullBody);
+      const pushRes = await Notifier.send(s, s.notifyTitle || t("pushTitle", lang), fullBody);
       log(`[PUSH] ${pushRes}`);
     }
   }
@@ -1139,13 +1162,8 @@ async function checkAndRenew(env, isSched, lang = "zh") {
 
   const hasError = logs.some(l => l.includes('[WARN]') || l.includes('[ERR]'));
 
-  if (act.length === 0) {
-    act.push("normal"); // 无论手动还是 Cron，只要没动作都记为 Normal
-  }
-  // 如果有错误，确保升级为 Alert
-  if (hasError && !act.includes("alert")) {
-    act.push("alert");
-  }
+  if (act.length === 0) act.push("normal");
+  if (hasError && !act.includes("alert")) act.push("alert");
 
   if (act.length > 0) {
     await DataStore.saveLog(env, {
@@ -1156,7 +1174,6 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     });
   }
 
-  // 返回时也带上 version
   return { logs, currentList: items, version: currentVersion };
 }
 // ==========================================
@@ -1241,30 +1258,39 @@ app.post(
   withAuth(async (req, env) => {
     const body = await req.json();
 
-    // 处理 items 数据清洗
-    const items = body.items.map((i) => ({
-      ...i,
-      id: i.id || Date.now().toString(),
-      intervalDays: Number(i.intervalDays),
-      enabled: i.enabled !== false,
-      tags: Array.isArray(i.tags) ? i.tags : [],
-      useLunar: !!i.useLunar,
-      notifyDays: i.notifyDays !== null ? Number(i.notifyDays) : null,
-      notifyTime: i.notifyTime || "08:00",
-      autoRenew: i.autoRenew !== false,
-      autoRenewDays: i.autoRenewDays !== null ? Number(i.autoRenewDays) : null,
-    }));
-
+    // 1. 先获取新的设置（为了拿到最新的时区 timezone）
     const currentSettings = await DataStore.getSettings(env);
     const newSettings = {
       ...body.settings,
       jwtSecret: currentSettings.jwtSecret,
     };
 
+    // 2. 处理 items 数据清洗 + 【关键修复】强制重新计算状态
+    const items = body.items.map((i) => {
+      // 基础数据清洗
+      const cleanItem = {
+        ...i,
+        id: i.id || Date.now().toString(),
+        intervalDays: Number(i.intervalDays),
+        enabled: i.enabled !== false,
+        tags: Array.isArray(i.tags) ? i.tags : [],
+        useLunar: !!i.useLunar,
+        notifyDays: i.notifyDays !== null ? Number(i.notifyDays) : null,
+        notifyTime: i.notifyTime || "08:00",
+        autoRenew: i.autoRenew !== false,
+        autoRenewDays: i.autoRenewDays !== null ? Number(i.autoRenewDays) : null,
+        fixedPrice: Number(i.fixedPrice) || 0,
+        currency: i.currency || 'CNY',
+        renewHistory: Array.isArray(i.renewHistory) ? i.renewHistory : [],
+      };
+
+      // 【核心修复】在保存前，使用后端逻辑重新计算 nextDueDate 等字段
+      // 确保存入 KV/数据库 的数据永远是基于当前历史记录计算出的最新状态
+      return calculateStatus(cleanItem, newSettings.timezone);
+    });
+
     try {
-      // 【修改】获取前端传来的 version，进行乐观锁保存
-      // 如果前端没传 version (旧版前端)，视作 null，可能会导致覆盖，但在升级过渡期允许
-      // 或者强制要求 version，这里假设前端会传
+      // 获取前端传来的 version，进行乐观锁保存
       const clientVersion =
         body.version !== undefined ? Number(body.version) : null;
 
@@ -1275,7 +1301,7 @@ app.post(
       return response({ code: 200, msg: "SAVED", version: newVersion });
     } catch (e) {
       if (e.message === "VERSION_CONFLICT") {
-        return error("DATA_CHANGED_RELOAD_REQUIRED", 409); // 返回 409 状态码
+        return error("DATA_CHANGED_RELOAD_REQUIRED", 409);
       }
       throw e;
     }
@@ -1588,7 +1614,15 @@ const HTML = `<!DOCTYPE html>
         .el-input-group__append .el-select .el-input.is-focus .el-input__wrapper { box-shadow: none !important; }
         .el-input-group__append .el-select { margin: 0; }
         .el-input-group__append .el-select .el-input__inner { text-align: center; font-weight: bold; font-size: 12px; }
+
+        /* Timeline Fixes */
+        .el-timeline-item__node--normal { width: 10px; height: 10px; left: 0px; }
+        .el-timeline-item__tail { left: 4px; border-left: 2px dashed var(--border); }
+        .el-timeline-item__wrapper { padding-left: 24px; top: -3px; }
         
+        /* Dark Mode adjustments for Timeline */
+        html.dark .mecha-panel { box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+        html.dark .el-timeline-item__tail { border-left-color: #334155; }
         .disabled-row { opacity: 0.5; filter: grayscale(1); }
         .tag-compact { display: inline-flex; height: 16px; padding: 0 6px; border-radius: 3px; font-size: 9px; font-weight: 600; background: var(--bg-body); color: var(--text-dim); border: 1px solid var(--border); align-items: center; }
         
@@ -1693,10 +1727,9 @@ const HTML = `<!DOCTYPE html>
             font-weight: bold !important;
         }
         .el-table { --el-table-bg-color: var(--bg-panel); --el-table-tr-bg-color: var(--bg-panel); --el-table-header-bg-color: var(--bg-body); --el-table-row-hover-bg-color: var(--bg-body); --el-table-border-color: var(--border); --el-table-text-color: var(--text-main); --el-table-header-text-color: var(--text-dim); }
+        .el-table .cell { padding-left: 8px !important; padding-right: 8px !important; }
         html.dark .lunar-popper .el-year-table td .cell, html.dark .lunar-popper .el-month-table td .cell { color: #cbd5e1; }
-        
-        .notify-tabs .el-tabs__header { margin-bottom: 20px; }
-        .notify-tabs .el-tabs__nav-wrap::after { background-color: var(--border); }
+
         .notify-item-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
         .notify-label { width: 90px; text-align: right; font-size: 12px; color: var(--text-dim); font-weight: 600; flex-shrink: 0; }
         
@@ -1775,11 +1808,43 @@ const HTML = `<!DOCTYPE html>
                     </div>
                 </div>
                 
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-blue-500"><div class="text-blue-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('totalServices') }}</div><div class="text-5xl font-black font-mono text-textMain">{{ list.length }}</div></div>
-                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-amber-500"><div class="text-amber-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('expiringSoon') }}</div><div class="text-5xl font-black font-mono text-amber-500">{{ expiringCount }}</div></div>
-                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-red-500"><div class="text-red-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('expiredAlert') }}</div><div class="text-5xl font-black font-mono text-red-500">{{ expiredCount }}</div></div>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-blue-500">
+                        <div class="text-blue-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('totalServices') }}</div>
+                        <div class="flex items-baseline gap-3">
+                            <div class="text-5xl font-black font-mono text-textMain">{{ list.length }}</div>
+                            <div class="text-xs font-bold font-mono text-blue-600/60" v-if="list.length > 0">≈ {{ totalAmount }} {{ settings.defaultCurrency || 'CNY' }}</div>
+                        </div>
+                    </div>
+                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-amber-500">
+                        <div class="text-amber-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('expiringSoon') }}</div>
+                        <div class="flex items-baseline gap-3">
+                            <div class="text-5xl font-black font-mono text-amber-500 leading-none">{{ expiringCount }}</div>
+                            <div class="text-xs font-bold font-mono text-amber-600/60" v-if="expiringCount > 0">≈ {{ expiringTotal }} {{ settings.defaultCurrency || 'CNY' }}</div>
+                        </div>
+                    </div>
+                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-red-500">
+                        <div class="text-red-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('expiredAlert') }}</div>
+                        <div class="flex items-baseline gap-3">
+                            <div class="text-5xl font-black font-mono text-red-500 leading-none">{{ expiredCount }}</div>
+                            <div class="text-xs font-bold font-mono text-red-600/60" v-if="expiredCount > 0">≈ {{ expiredTotal }} {{ settings.defaultCurrency || 'CNY' }}</div>
+                        </div>
+                    </div>
+                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-purple-500">
+                        <div class="text-purple-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('viewSwitch') }}</div>
+                        <div class="mt-3 flex w-full bg-gray-200 dark:bg-slate-800 rounded-lg p-1 border border-gray-300 dark:border-slate-700">
+                            <button @click="currentView = 'project'" :class="['flex-1 px-4 py-2 rounded text-xs font-mono font-bold transition-all text-center justify-center', currentView === 'project' ? 'bg-purple-600 text-white shadow-lg' : 'text-gray-500 dark:text-gray-400 hover:text-black dark:hover:text-white']">
+                                {{ t('viewProjects') }}
+                            </button>
+                            <button @click="currentView = 'spending'" :class="['flex-1 px-4 py-2 rounded text-xs font-mono font-bold transition-all text-center justify-center', currentView === 'spending' ? 'bg-purple-600 text-white shadow-lg' : 'text-gray-500 dark:text-gray-400 hover:text-black dark:hover:text-white']">
+                                {{ t('viewSpending') }}
+                            </button>
+                        </div>
+                    </div>
                 </div>
+
+                <!-- Project View -->
+                <template v-if="currentView === 'project'">
 
                 <div class="filter-row" v-if="list.length > 0">
                     <div class="search-box"><el-input v-model="searchKeyword" :placeholder="t('searchPlaceholder')" clearable :prefix-icon="Search"></el-input></div>
@@ -1795,7 +1860,7 @@ const HTML = `<!DOCTYPE html>
                     <div class="hud-bar-container"><div class="hud-text" style="margin-right:12px;color:#94a3b8">MATCHED: <span class="text-white text-lg mx-1">{{ filteredList.length }}</span></div><div class="hud-bar" style="animation-delay:0s"></div><div class="hud-bar" style="animation-delay:0.1s"></div><div class="hud-bar" style="animation-delay:0.2s"></div><div class="hud-bar" style="animation-delay:0.3s"></div><div class="hud-bar" style="animation-delay:0.4s"></div></div>
                 </div>
   <div class="mecha-panel p-1 !border-l-0">
-    <el-table :key="tableKey" :data="pagedList" style="width:100%" v-loading="loading" :row-class-name="tableRowClassName" size="large" @sort-change="handleSortChange" @filter-change="handleFilterChange" :default-sort="{prop: 'daysLeft', order: 'ascending'}">       
+    <el-table :key="tableKey" :data="pagedList" style="width:100%" v-loading="loading" :row-class-name="tableRowClassName" size="large" @sort-change="handleSortChange" @filter-change="handleFilterChange" :default-sort="{prop: 'daysLeft', order: 'ascending'}" show-summary :summary-method="getSummaries">       
         <el-table-column :label="t('serviceName')" min-width="230">
             <template #default="scope">
                 <div class="flex items-center gap-4">
@@ -1811,6 +1876,15 @@ const HTML = `<!DOCTYPE html>
         <el-table-column :label="t('tagsCol')" min-width="120">
             <template #default="scope">
                 <div class="tag-container"><span v-for="tag in scope.row.tags" :key="tag" class="tag-compact">{{ tag }}</span></div>
+            </template>
+        </el-table-column>
+
+        <el-table-column :label="t('fixedPrice')" width="100" prop="fixedPrice" sortable="custom">
+            <template #default="scope">
+                <div class="font-mono">
+                    <span class="text-base font-bold text-slate-700 dark:text-slate-200">{{ scope.row.fixedPrice }}</span>
+                    <span class="text-[10px] text-gray-400 font-bold ml-1 align-top">{{ scope.row.currency }}</span>
+                </div>
             </template>
         </el-table-column>
 
@@ -1845,9 +1919,9 @@ const HTML = `<!DOCTYPE html>
             </template>
         </el-table-column>
 
-        <el-table-column :label="t('lastRenew')" width="140" prop="lastRenewDate" sortable="custom" column-key="lastRenewDate" :filters="lastRenewFilters">
+        <el-table-column :label="t('lastRenew')" width="120" prop="lastRenewDate" sortable="custom" column-key="lastRenewDate" :filters="lastRenewFilters">
             <template #default="scope">
-                <div class="font-mono text-textDim text-sm font-bold">{{ scope.row.lastRenewDate }}</div>
+                <div class="font-mono text-textDim text-sm font-bold">{{ scope.row.lastRenewDate ? scope.row.lastRenewDate.replace(/\s+/g, '').replace(/(\d{4}-\d{2}-\d{2}).*/, '$1') : '' }}</div>
                 <div v-if="scope.row.useLunar && scope.row.lastRenewDateLunar" class="text-[10px] text-gray-400 font-mono">({{ scope.row.lastRenewDateLunar }})</div>
             </template>
         </el-table-column>
@@ -1870,20 +1944,14 @@ const HTML = `<!DOCTYPE html>
 
                     <!-- Desktop View -->
                     <template v-if="windowWidth >= 640">
-                        <el-popconfirm 
-                            :title="t('msg.confirmRenew').replace('%s', scope.row.name)"
-                            :confirm-button-text="t('yes')" 
-                            :cancel-button-text="t('no')"
-                            width="200"
-                            @confirm="manualRenew(scope.row)">
-                            <template #reference>
-                                <div class="inline-flex">
-                                    <el-tooltip :content="t('tipRenew')" placement="top" :hide-after="0">
-                                        <el-button class="!p-2 !rounded-none !ml-0" size="small" type="success" plain :icon="RefreshRight"></el-button>
-                                    </el-tooltip>
-                                </div>
-                            </template>
-                        </el-popconfirm>
+                        <div class="inline-flex">
+                             <el-tooltip :content="t('tipRenew')" placement="top" :hide-after="0">
+                                 <el-button class="!p-2 !rounded-none !ml-0" size="small" type="success" plain :icon="RefreshRight" @click="openRenew(scope.row)"></el-button>
+                             </el-tooltip>
+                             <el-tooltip :content="t('history')" placement="top" :hide-after="0">
+                                 <el-button class="!p-2 !rounded-none !ml-0" size="small" type="warning" plain :icon="Tickets" @click="openHistory(scope.row)"></el-button>
+                             </el-tooltip>
+
                         <el-tooltip :content="t('tipEdit')" placement="top" :hide-after="0">
                             <el-button class="!p-2 !rounded-none !ml-0" size="small" type="primary" plain :icon="Edit" @click="editItem(scope.row)"></el-button>
                         </el-tooltip>
@@ -1899,6 +1967,7 @@ const HTML = `<!DOCTYPE html>
                                         <el-button class="!p-2 !rounded-none !ml-0" size="small" type="danger" plain :icon="Delete"></el-button>
                                     </el-tooltip>
                                 </div>
+                            </div>    
                             </template>
                         </el-popconfirm>
                     </template>
@@ -1909,7 +1978,8 @@ const HTML = `<!DOCTYPE html>
                             <el-button class="!p-2 !rounded-none !ml-0" size="small" type="primary" plain :icon="More"></el-button>
                             <template #dropdown>
                               <el-dropdown-menu>
-                                <el-dropdown-item :icon="RefreshRight" @click="confirmRenew(scope.row)">{{ t('tipRenew') }}</el-dropdown-item>
+                                <el-dropdown-item :icon="RefreshRight" @click="openRenew(scope.row)">{{ t('tipRenew') }}</el-dropdown-item>
+                                <el-dropdown-item :icon="Tickets" @click="openHistory(scope.row)">{{ t('history') }}</el-dropdown-item>
                                 <el-dropdown-item :icon="Edit" @click="editItem(scope.row)">{{ t('tipEdit') }}</el-dropdown-item>
                                 <el-dropdown-item :icon="Delete" @click="confirmDelete(scope.row)" divided class="text-red-500">{{ t('tipDelete') }}</el-dropdown-item>
                               </el-dropdown-menu>
@@ -1938,9 +2008,385 @@ const HTML = `<!DOCTYPE html>
                     </div>
                 </div>
 
+                </template>
+                <!-- End Project View -->
+
+                <!-- Spending View -->
+                <template v-else>
+                    <div class="spending-dashboard animate-fade-in" v-if="spendingStats.hasData">
+                         <!-- Header & Toggle -->
+                         <div class="flex justify-between items-center mb-6">
+                            <el-popover placement="bottom-start" :width="320" trigger="click" popper-class="!p-0 !bg-slate-900 !border-slate-700">
+                                <template #reference>
+                                     <div class="flex items-center gap-2 cursor-pointer group select-none">
+                                         <div class="relative flex items-center justify-center w-8 h-8 rounded-lg bg-slate-100 dark:bg-slate-800 group-hover:bg-slate-200 dark:group-hover:bg-slate-700 transition-colors">
+                                             <el-icon :class="upcoming7DaysBills.length>0?'animate-pulse text-amber-500':'text-gray-400'"><Bell /></el-icon>
+                                             <div v-if="upcoming7DaysBills.length > 0" class="absolute -top-1 -right-1 min-w-[16px] h-4 flex items-center justify-center text-[10px] font-bold text-white bg-red-500 rounded-full px-1 shadow-sm ring-2 ring-white dark:ring-slate-900">
+                                                 {{ upcoming7DaysBills.length }}
+                                             </div>
+                                         </div>
+                                         <div class="flex flex-col justify-center h-8">
+                                             <span class="text-xs font-bold font-mono text-slate-700 dark:text-slate-300 group-hover:text-amber-600 dark:group-hover:text-amber-500 transition-colors">{{ t('upcomingBills').replace('%s', settings.upcomingBillsDays || 7) }}</span>
+                                         </div>
+                                     </div>
+                                </template>
+                                <!-- Popover Content -->
+                                <div class="flex flex-col max-h-[300px] overflow-y-auto custom-scrollbar">
+                                    <div class="px-4 py-3 border-b border-slate-800 bg-slate-900/50 sticky top-0 z-10 backdrop-blur flex justify-between items-center">
+                                        <div class="text-xs font-bold font-mono text-gray-400">{{ t('filter.w7').replace('%s', settings.upcomingBillsDays || 7) }}</div>
+                                        <div class="text-xs font-bold font-mono text-cyan-400" v-if="upcoming7DaysBills.length > 0">{{ upcoming7DaysTotal }}</div>
+                                    </div>
+                                    <div v-if="upcoming7DaysBills.length > 0" class="p-2 space-y-1">
+                                         <div v-for="(bill, idx) in upcoming7DaysBills" :key="'up-'+idx" class="flex justify-between items-center p-2 rounded hover:bg-slate-800/50 transition-colors cursor-default group">
+                                             <div class="flex flex-col overflow-hidden mr-3">
+                                                 <div class="flex items-center gap-1">
+                                                     <span class="text-xs font-bold font-mono text-slate-300 truncate">{{ bill.name }}</span>
+                                                     <span v-if="bill.isProjected" class="text-[9px] px-1 rounded bg-blue-500/20 text-blue-400 border border-blue-500/30 scale-90 origin-left whitespace-nowrap">{{ t('predictedTag') }}</span>
+                                                 </div>
+                                                 <span class="text-xs text-amber-500 font-mono font-bold">{{ bill.days === 0 ? (lang==='zh'?'今天':'TODAY') : bill.days + (lang==='zh'?' 天剩余':' DAYS LEFT') }}</span>
+                                             </div>
+                                             <div class="text-right shrink-0">
+                                                  <div class="text-xs font-bold font-mono text-cyan-400">{{ bill.amount }} <span class="text-[9px] opacity-70">{{ bill.currency }}</span></div>
+                                             </div>
+                                         </div>
+                                    </div>
+                                    <div v-else class="p-8 text-center">
+                                        <el-icon class="text-4xl text-slate-800 mb-2"><files /></el-icon>
+                                        <div class="text-xs text-gray-600 font-mono">{{ t('noData') }}</div>
+                                    </div>
+                                </div>
+                            </el-popover>
+
+                             <div class="flex bg-gray-200 dark:bg-slate-800 rounded-lg p-1 border border-gray-300 dark:border-slate-700">
+                                 <button @click="spendingMode='bill'" :class="['px-3 py-1 text-xs font-mono rounded transition-all', spendingMode==='bill' ? 'bg-cyan-600 text-white shadow-lg' : 'text-gray-500 dark:text-gray-400 hover:text-black dark:hover:text-white']">{{ t('billAmount') }}</button>
+                                 <button @click="spendingMode='op'" :class="['px-3 py-1 text-xs font-mono rounded transition-all', spendingMode==='op' ? 'bg-purple-600 text-white shadow-lg' : 'text-gray-500 dark:text-gray-400 hover:text-black dark:hover:text-white']">{{ t('opSpending') }}</button>
+                             </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                             <!-- LEFT PANEL: Monthly Trend Chart & Item Details -->
+                             <div class="lg:col-span-8 flex flex-col space-y-6">
+                                 <!-- 1. Monthly Trend Chart Panel -->
+                                 <div class="mecha-panel p-6 border-l-4 transition-colors duration-500 animate-slide-in flex-1" 
+                                      :class="spendingMode==='bill' ? '!border-l-cyan-500' : '!border-l-purple-500'"
+                                      style="animation-delay: 0.1s; min-height: 380px;">
+                                     
+                                     <div class="flex justify-between items-center mb-6">
+                                         <div class="text-xs font-bold font-mono tracking-widest uppercase transition-colors duration-300"
+                                              :class="spendingMode==='bill' ? 'text-cyan-600' : 'text-purple-600'">
+                                              {{ t('monthlyTrend') }} <span class="opacity-50">({{ spendingMode==='bill' ? '12M' : '12M' }})</span>
+                                         </div>
+                                     </div>
+
+                                     <!-- Chart Container (Restored height to h-52) -->
+                                     <div class="relative h-52 pl-12 pr-4 pt-6 select-none">
+                                         <!-- Y-axis labels -->
+                                         <div class="absolute left-0 top-8 bottom-8 flex flex-col justify-between text-[10px] font-mono text-gray-400 pr-2 w-10 text-right">
+                                             <span>{{ Math.max(...spendingStats[spendingMode].trends.map(m => parseFloat(m.val)), 0).toFixed(0) }}</span>
+                                             <span>0</span>
+                                         </div>
+                                         
+                                         <div class="h-full relative chart-container" @mouseleave="hoverIndex = -1">
+                                             <!-- 1. Bars Layer (HTML for perfect aspect ratio) -->
+                                             <div class="absolute inset-0">
+                                                 <div v-for="(item, idx) in spendingStats[spendingMode].trends" :key="spendingMode+'-bar-'+idx"
+                                                      class="absolute h-full flex items-end justify-center cursor-pointer"
+                                                      :style="{ left: ((idx / 12) * 100) + '%', width: (100/12) + '%' }"
+                                                      @mouseenter="hoverIndex = idx"
+                                                      @click="selectedMonth = selectedMonth === item.month ? null : item.month">
+                                                     
+                                                      <div class="w-[70%] rounded-t transition-all duration-300 relative bar-animate"
+                                                          :class="selectedMonth === item.month ? 'ring-2 ring-offset-1 ring-offset-transparent ' + (spendingMode==='bill' ? 'ring-cyan-300' : 'ring-purple-300') : ''"
+                                                          :style="{ 
+                                                              height: item.pct + '%', 
+                                                              opacity: selectedMonth === item.month ? 1 : ((hoverIndex === -1 || hoverIndex === idx) ? 1 : 0.3),
+                                                              animationDelay: (idx * 0.05) + 's' 
+                                                          }">
+                                                          <!-- Gradient Background -->
+                                                          <div class="absolute inset-0 rounded-t"
+                                                               :class="spendingMode==='bill' ? 'bg-gradient-to-t from-cyan-400 to-cyan-600' : 'bg-gradient-to-t from-purple-400 to-purple-600'"
+                                                               :style="{ opacity: selectedMonth === item.month ? 1 : 0.8 }"></div>
+                                                          <!-- Selected/Hover Highlight Line -->
+                                                          <div v-if="hoverIndex === idx || selectedMonth === item.month" class="absolute top-0 left-0 right-0 h-[2px] bg-white shadow-glow"></div>
+                                                      </div>
+                                                 </div>
+                                             </div>
+
+                                             <!-- 2. Line Layer (SVG for path) -->
+                                             <svg :key="spendingMode+'-line'" class="absolute inset-0 w-full h-full pointer-events-none overflow-visible" viewBox="0 0 100 100" preserveAspectRatio="none">
+                                                 <!-- Average Line (Dashed) -->
+                                                 <line v-if="spendingStats[spendingMode].avgPct > 0"
+                                                     x1="0" 
+                                                     :y1="100 - spendingStats[spendingMode].avgPct" 
+                                                     x2="100" 
+                                                     :y2="100 - spendingStats[spendingMode].avgPct"
+                                                     :stroke="spendingMode==='bill' ? '#22d3ee' : '#a78bfa'"
+                                                     stroke-width="1.5"
+                                                     stroke-dasharray="4 3"
+                                                     vector-effect="non-scaling-stroke"
+                                                     opacity="0.7"
+                                                 />
+                                                 <polyline 
+                                                     fill="none" 
+                                                     :stroke="spendingMode==='bill' ? '#67e8f9' : '#c4b5fd'"
+                                                     stroke-width="2"
+                                                     stroke-linecap="round"
+                                                     stroke-linejoin="round"
+                                                     vector-effect="non-scaling-stroke"
+                                                     class="draw-line-animate"
+                                                     :points="spendingStats[spendingMode].trends.map((item, idx) => {
+                                                         const x = ((idx + 0.5) / 12) * 100;
+                                                         const y = 100 - item.pct;
+                                                         return x + ',' + y;
+                                                     }).join(' ')"
+                                                 />
+                                             </svg>
+
+                                             <!-- Average Value Label (Above Dashed Line) -->
+                                             <div v-if="spendingStats[spendingMode].avgPct > 0"
+                                                  class="absolute left-2 pointer-events-none text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-slate-900/70 dark:bg-slate-800/90 backdrop-blur-sm border transition-colors duration-300"
+                                                  :class="spendingMode==='bill' ? 'text-cyan-400 border-cyan-500/30' : 'text-purple-400 border-purple-500/30'"
+                                                  :style="{ top: 'calc(' + (100 - spendingStats[spendingMode].avgPct) + '% - 22px)' }">
+                                                 {{ t('avgMonthlyLabel') }}: {{ spendingStats[spendingMode].avgVal.toFixed(2) }} {{ settings.defaultCurrency || 'CNY' }}
+                                             </div>
+
+                                             <!-- 3. Dots Layer (HTML for non-distorted dots) -->
+                                             <div class="absolute inset-0 pointer-events-none">
+                                                 <div v-for="(item, idx) in spendingStats[spendingMode].trends" :key="spendingMode+'-dot-'+idx"
+                                                      class="absolute w-3 h-3 rounded-full border-2 transition-transform duration-300 fade-in-animate"
+                                                      :class="[
+                                                          item.isCurrent ? 'bg-white border-amber-500 scale-125 z-10' : (spendingMode==='bill' ? 'bg-cyan-500 border-cyan-200' : 'bg-purple-500 border-purple-200'),
+                                                          hoverIndex === idx ? 'scale-150' : ''
+                                                      ]"
+                                                      :style="{ 
+                                                          left: 'calc(' + ((idx + 0.5) / 12) * 100 + '% - 6px)', 
+                                                          top: 'calc(' + (100 - item.pct) + '% - 6px)',
+                                                          animationDelay: (0.8 + idx * 0.05) + 's' 
+                                                      }">
+                                                 </div>
+                                             </div>
+
+                                             <!-- Tooltip -->
+                                             <div v-if="hoverIndex !== -1" 
+                                                  class="absolute z-20 pointer-events-none transform -translate-x-1/2 transition-all duration-75"
+                                                  :style="{ 
+                                                      left: ((hoverIndex + 0.5) / 12) * 100 + '%', 
+                                                      top: Math.max(0, 100 - spendingStats[spendingMode].trends[hoverIndex].pct - 20) + '%' 
+                                                  }">
+                                                 <div class="bg-slate-900/95 backdrop-blur border border-slate-600 text-white text-xs rounded p-3 shadow-2xl whitespace-nowrap min-w-[120px]">
+                                                     <div class="font-bold text-[10px] text-slate-400 mb-2 uppercase">{{ spendingStats[spendingMode].trends[hoverIndex].month }}</div>
+                                                     <div class="flex justify-between items-end mb-1">
+                                                         <span class="text-[10px] text-slate-400">{{ t('total') }}</span>
+                                                         <span class="font-mono font-bold text-sm">{{ spendingStats[spendingMode].trends[hoverIndex].total }} <span class="text-[10px] opacity-70">{{ settings.defaultCurrency || 'CNY' }}</span></span>
+                                                     </div>
+                                                     <div class="flex justify-between items-center mb-1">
+                                                         <span class="text-[10px] text-slate-400">{{ t('count') }}</span>
+                                                         <span class="font-mono font-bold text-[11px]">{{ spendingStats[spendingMode].trends[hoverIndex].count }}</span>
+                                                     </div>
+                                                     <div class="flex justify-between items-center border-t border-slate-700 pt-1 mt-1">
+                                                         <span class="text-[9px] text-slate-500">{{ t('growth') }}</span>
+                                                         <span :class="['font-mono text-[10px] font-bold', parseFloat(spendingStats[spendingMode].trends[hoverIndex].growth) > 0 ? 'text-red-400' : (parseFloat(spendingStats[spendingMode].trends[hoverIndex].growth) < 0 ? 'text-green-400' : 'text-gray-400')]">
+                                                             {{ parseFloat(spendingStats[spendingMode].trends[hoverIndex].growth) > 0 ? '+' : '' }}{{ spendingStats[spendingMode].trends[hoverIndex].growth }}%
+                                                         </span>
+                                                     </div>
+                                                 </div>
+                                             </div>
+                                         </div>
+                                     </div>
+                                     
+                                     <!-- X-Axis Labels -->
+                                     <div class="ml-12 mr-4 flex justify-between mt-2">
+                                         <div v-for="(item, idx) in spendingStats[spendingMode].trends" :key="'l-'+item.month" 
+                                              class="flex-1 text-center" @mouseenter="hoverIndex = idx">
+                                             <div :class="['text-[9px] font-mono mt-1 transition-colors', 
+                                                 item.isCurrent ? 'text-amber-500 font-bold' : 'text-gray-400',
+                                                 hoverIndex === idx ? 'text-blue-500 font-bold' : '']">
+                                                 {{ item.month.slice(5) }}
+                                             </div>
+                                         </div>
+                                     </div>
+                                 </div>
+                                 
+                                <!-- 2. Month Detail Card -->
+                                <div class="mecha-panel p-4 border-t-4 transition-all duration-300 animate-slide-in flex-1"
+                                      :class="spendingMode==='bill' ? '!border-t-cyan-500' : '!border-t-purple-500'"
+                                      style="min-height: 280px;">
+                                     <div class="flex justify-between items-center mb-3">
+                                         <div class="text-xs font-bold font-mono tracking-widest uppercase transition-colors"
+                                              :class="spendingMode==='bill' ? 'text-cyan-500' : 'text-purple-500'">
+                                             {{ selectedMonth || '-' }} {{ t('itemDetails') }}
+                                         </div>
+                                         <div class="text-xs font-mono text-gray-400">{{ monthDetails.length }} {{ t('count') }}</div>
+                                     </div>
+                                     <div class="overflow-y-auto custom-scrollbar space-y-1" style="max-height: 280px;">
+                                         <div v-if="monthDetails.length === 0" class="h-full flex items-center justify-center text-gray-400 dark:text-gray-500 text-sm font-mono">
+                                             {{ t('noData') }}
+                                         </div>
+                                      <div v-else v-for="(item, idx) in monthDetails" :key="'md-'+idx"
+                                          class="flex justify-between items-center p-2 rounded bg-gray-50 dark:bg-slate-800/50 text-sm mb-1">
+                                          <div class="flex flex-col overflow-hidden mr-2">
+                                              <div class="flex items-center gap-2">
+                                                  <span class="font-mono truncate font-bold text-slate-700 dark:text-slate-300">{{ item.name }}</span>
+                                                  <span v-if="item.isProjected" class="text-[9px] px-1 rounded bg-blue-100 text-blue-600 dark:bg-blue-900 dark:text-blue-300">{{ t('predictedTag') }}</span>
+                                              </div>
+                                              <div class="text-[10px] text-gray-400 font-mono truncate">{{ item.period }}</div>
+                                          </div>
+                                          <span class="font-mono font-bold whitespace-nowrap" :class="spendingMode==='bill' ? 'text-cyan-500' : 'text-purple-500'">
+                                              {{ item.amount }} <span class="text-[10px] opacity-70">{{ settings.defaultCurrency || 'CNY' }}</span>
+                                          </span>
+                                      </div>
+                                     </div>
+                                 </div>
+                             </div>
+
+                             <!-- RIGHT PANEL: Stats -->
+                             <div class="lg:col-span-4 space-y-6">
+                                 <!-- Annual Summary -->
+                                 <div class="mecha-panel p-6 border-t-4 transition-colors duration-500 animate-slide-in" 
+                                      :class="spendingMode==='bill' ? '!border-t-cyan-500' : '!border-t-purple-500'"
+                                      style="animation-delay: 0.2s; min-height: 380px;">
+                                     <div class="flex justify-between items-center mb-6">
+                                         <div class="text-xs font-bold font-mono tracking-widest uppercase">{{ t('annualSummary') }}</div>
+                                         <el-icon class="text-gray-400"><Promotion /></el-icon>
+                                     </div>
+                                     
+                                     <!-- Selected Period Big Number -->
+                                     <div class="mb-6">
+                                          <div class="text-xs text-gray-400 font-mono mb-1">{{ spendingStats[spendingMode].selectedInfo?.label === '12M' ? t('last12M') : spendingStats[spendingMode].selectedInfo?.label }} {{ t('total') }}</div>
+                                          <div class="text-3xl font-bold font-mono tracking-tight" :class="spendingMode==='bill' ? 'text-cyan-500' : 'text-purple-500'">
+                                              {{ parseFloat(spendingStats[spendingMode].selectedInfo?.total || 0).toFixed(2) }} <span class="text-lg opacity-70">{{ settings.defaultCurrency || 'CNY' }}</span>
+                                          </div>
+                                     </div>
+
+                                     <!-- Annual Bars with 12M option -->
+                                     <div class="grid grid-cols-4 gap-2 h-52 items-end">
+                                         <!-- 3 Year Bars -->
+                                         <div v-for="y in spendingStats[spendingMode].annual" :key="'y-'+y.year" 
+                                              class="flex flex-col items-center gap-2 h-full justify-end group cursor-pointer transition-all"
+                                              @click="selectedYear = y.year">
+                                             <div class="text-[10px] font-mono font-bold transition-opacity -mb-4 z-10 bg-slate-800 text-white px-1 rounded"
+                                                  :class="selectedYear === y.year ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'">{{ parseFloat(y.total).toFixed(2) }} {{ settings.defaultCurrency || 'CNY' }}</div>
+                                             <div class="w-full rounded-t transition-all duration-300 relative overflow-hidden"
+                                                  :class="[
+                                                      selectedYear === y.year 
+                                                          ? (spendingMode==='bill' ? 'bg-cyan-500/60 ring-2 ring-cyan-400' : 'bg-purple-500/60 ring-2 ring-purple-400') 
+                                                          : (spendingMode==='bill' ? 'bg-cyan-500/20 hover:bg-cyan-500/40' : 'bg-purple-500/20 hover:bg-purple-500/40')
+                                                  ]"
+                                                  :style="{ height: Math.max(y.pct, 5) + '%' }">
+                                                  <div class="absolute bottom-0 left-0 right-0 top-0"
+                                                       :class="spendingMode==='bill' ? 'bg-cyan-500' : 'bg-purple-500'"
+                                                       :style="{ opacity: selectedYear === y.year ? 0.8 : 0.5, height: '80%' }"></div>
+                                             </div>
+                                             <div class="text-xs font-mono font-bold transition-colors"
+                                                  :class="selectedYear === y.year ? (spendingMode==='bill' ? 'text-cyan-400' : 'text-purple-400') : 'text-gray-500'">{{ y.year }}</div>
+                                         </div>
+                                         
+                                         <!-- 12M (Recent) Bar -->
+                                         <div class="flex flex-col items-center gap-2 h-full justify-end group cursor-pointer transition-all"
+                                              @click="selectedYear = 'recent'">
+                                             <div class="text-[10px] font-mono font-bold transition-opacity -mb-4 z-10 bg-slate-800 text-white px-1 rounded"
+                                                  :class="selectedYear === 'recent' ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'">{{ spendingStats[spendingMode].recentTotal?.toFixed(2) || '0.00' }} {{ settings.defaultCurrency || 'CNY' }}</div>
+                                             <div class="w-full rounded-t transition-all duration-300 relative overflow-hidden"
+                                                  :class="[
+                                                      selectedYear === 'recent' 
+                                                          ? (spendingMode==='bill' ? 'bg-amber-500/60 ring-2 ring-amber-400' : 'bg-amber-500/60 ring-2 ring-amber-400') 
+                                                          : (spendingMode==='bill' ? 'bg-amber-500/20 hover:bg-amber-500/40' : 'bg-amber-500/20 hover:bg-amber-500/40')
+                                                  ]"
+                                                  :style="{ height: Math.max(spendingStats[spendingMode].recentPct || 0, 5) + '%' }">
+                                                  <div class="absolute bottom-0 left-0 right-0 top-0 bg-amber-500"
+                                                       :style="{ opacity: selectedYear === 'recent' ? 0.8 : 0.5, height: '80%' }"></div>
+                                             </div>
+                                             <div class="text-xs font-mono font-bold transition-colors"
+                                                  :class="selectedYear === 'recent' ? 'text-amber-400' : 'text-gray-500'">{{ t('last12M') }}</div>
+                                         </div>
+                                     </div>
+                                 </div>
+
+                                 <!-- Monthly Breakdown List -->
+                                 <div class="mecha-panel p-0 overflow-hidden animate-slide-in" 
+                                      style="animation-delay: 0.3s; min-height: 280px;">
+                                     <div class="p-4 border-b border-gray-100 dark:border-slate-800 bg-gray-50/50 dark:bg-slate-800/30">
+                                         <div class="text-xs font-bold font-mono tracking-widest uppercase">{{ t('monthlyBreakdown') }}</div>
+                                     </div>
+                                     <div class="overflow-y-auto custom-scrollbar p-2" style="max-height: 280px;">
+                                         <div v-for="m in spendingStats[spendingMode].trends.slice().reverse()" :key="'mb-'+m.month"
+                                              class="flex items-center justify-between p-3 mb-1 rounded transition-colors group cursor-pointer"
+                                              :class="selectedMonth === m.month ? (spendingMode==='bill' ? 'bg-cyan-500/20 ring-1 ring-cyan-500/50' : 'bg-purple-500/20 ring-1 ring-purple-500/50') : 'hover:bg-gray-100 dark:hover:bg-slate-700/50'"
+                                              @click="selectedMonth = selectedMonth === m.month ? null : m.month">
+                                              
+                                              <div class="flex items-center gap-3">
+                                                  <div class="w-1.5 h-8 rounded-full transition-colors"
+                                                       :class="[
+                                                           selectedMonth === m.month ? (spendingMode==='bill' ? 'bg-cyan-400' : 'bg-purple-400') :
+                                                           (m.isCurrent ? (spendingMode==='bill' ? 'bg-cyan-500' : 'bg-purple-500') : 'bg-gray-200 dark:bg-slate-700')
+                                                       ]"></div>
+                                                  <div>
+                                                      <div class="text-xs font-bold font-mono">{{ m.month }}</div>
+                                                      <div class="text-xs text-gray-400" v-if="m.isCurrent">{{ t('currMonth') }}</div>
+                                                  </div>
+                                              </div>
+
+                                              <div class="text-right">
+                                                  <div class="font-mono font-bold text-sm">{{ m.total }} <span class="text-[10px] opacity-70">{{ settings.defaultCurrency || 'CNY' }}</span></div>
+                                                  <div class="text-[10px] font-mono mt-0.5" 
+                                                       v-if="m.val > 0 || m.prevVal > 0"
+                                                       :class="parseFloat(m.growth) > 0 ? 'text-red-500' : (parseFloat(m.growth) < 0 ? 'text-green-500' : 'text-gray-500')">
+                                                      {{ parseFloat(m.growth) > 0 ? '↑' : (parseFloat(m.growth) < 0 ? '↓' : '-') }} {{ Math.abs(m.growth) }}%
+                                                  </div>
+                                              </div>
+                                         </div>
+                                     </div>
+                                 </div>
+                             </div>
+                        </div>
+                    </div>
+                    <div v-else class="mecha-panel p-12 text-center animate-fade-in">
+                        <div class="text-gray-500 dark:text-gray-400 font-mono text-lg">{{ t('noSpendingData') }}</div>
+                    </div>
+
+                    <style>
+                        @keyframes growUp {
+                            from { transform: scaleY(0); }
+                            to { transform: scaleY(1); }
+                        }
+                        @keyframes fadeIn {
+                            from { opacity: 0; }
+                            to { opacity: 1; }
+                        }
+                        @keyframes slideIn {
+                            from { opacity: 0; transform: translateY(10px); }
+                            to { opacity: 1; transform: translateY(0); }
+                        }
+                        @keyframes drawLine {
+                            0% { stroke-dashoffset: 2000; }
+                            100% { stroke-dashoffset: 0; }
+                        }
+                        .bar-animate {
+                            transform-origin: center bottom;
+                            animation: growUp 0.8s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+                        }
+                        .fade-in-animate {
+                            animation: fadeIn 0.5s ease-out backwards;
+                        }
+                        .animate-slide-in {
+                            animation: slideIn 0.5s ease-out backwards;
+                        }
+                        .draw-line-animate {
+                            stroke-dasharray: 2000;
+                            stroke-dashoffset: 2000;
+                            animation: drawLine 1.8s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+                            animation-delay: 0.3s;
+                        }
+                        .shadow-glow {
+                            box-shadow: 0 0 10px rgba(255,255,255,0.5);
+                        }
+                    </style>
+                </template>
+                <!-- End Spending View -->
+
                 <div class="mt-8 py-6 text-center border-t border-slate-200/60">
                     <p class="text-[10px] text-gray-400 font-mono tracking-[0.2em] uppercase flex justify-center items-center gap-1">
-                        &copy; 2025 <a href="https://github.com/ieax/renewhelper" target="_blank" class="font-bold text-slate-600 hover:text-blue-600 transition-colors border-b border-dashed border-slate-300 hover:border-blue-600 pb-0.5 mx-1 decoration-0">RenewHelper</a>
+                        &copy; 2025-2026 <a href="https://github.com/ieax/renewhelper" target="_blank" class="font-bold text-slate-600 hover:text-blue-600 transition-colors border-b border-dashed border-slate-300 hover:border-blue-600 pb-0.5 mx-1 decoration-0">RenewHelper</a>
                         <span class="text-blue-500 font-bold">${APP_VERSION}</span><span class="mx-2 opacity-30">|</span>DESIGNED BY <span class="font-bold text-slate-600">LOSTFREE</span>
                     </p>
                 </div>                  
@@ -1950,6 +2396,11 @@ const HTML = `<!DOCTYPE html>
                 <el-form :model="form" label-position="top">
                     <el-form-item :label="t('formName')"><el-input v-model="form.name" size="large"><template #prefix><el-icon><Monitor/></el-icon></template></el-input></el-form-item>
                     <el-form-item :label="t('tags')"><el-select v-model="form.tags" multiple filterable allow-create default-first-option :reserve-keyword="false" :placeholder="t('tagPlaceholder')" style="width:100%" size="large"><el-option v-for="tag in allTags" :key="tag" :label="tag" :value="tag"></el-option></el-select></el-form-item>
+                    
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <el-form-item :label="t('fixedPrice')" class="!mb-0"><el-input-number v-model="form.fixedPrice" :min="0" :precision="2" class="!w-full" controls-position="right"></el-input-number></el-form-item>
+                        <el-form-item :label="t('currency')" class="!mb-0"><el-select v-model="form.currency" filterable class="!w-full"><el-option v-for="c in currencyList" :key="c" :label="c" :value="c"></el-option></el-select></el-form-item>
+                    </div>
 
                     <div class="flex flex-col sm:flex-row items-end gap-4 mb-4">
                         <el-form-item :label="t('formType')" class="!mb-0 flex-1 w-full"><div class="radio-group-fix"><div class="radio-item" :class="{active:form.type==='cycle'}" @click="form.type='cycle'">📅 {{ t('cycle') }}</div><div class="radio-item" :class="{active:form.type==='reset'}" @click="form.type='reset'">⏳ {{ t('reset') }}</div></div></el-form-item>
@@ -2040,13 +2491,23 @@ const HTML = `<!DOCTYPE html>
                                 </el-option>
                             </el-select>
                         </el-form-item>
-                        <el-form-item :label="t('autoDisableThreshold')"><el-input-number v-model="settingsForm.autoDisableDays" :min="1" class="!w-full"></el-input-number></el-form-item>
+                        <el-form-item :label="t('defaultCurrency')">
+                            <el-select v-model="settingsForm.defaultCurrency" style="width:100%" filterable>
+                                <el-option v-for="c in currencyList" :key="c" :label="c" :value="c"></el-option>
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item :label="t('autoDisableThreshold')"><el-input-number v-model="settingsForm.autoDisableDays" :min="1" :max="365" class="!w-full"></el-input-number></el-form-item>
+                        <el-form-item :label="t('upcomingBillsDays')"><el-input-number v-model="settingsForm.upcomingBillsDays" :min="1" :max="365" class="!w-full"></el-input-number></el-form-item>
                     </div>
 
                     <h4 class="text-xs font-bold text-blue-600 mb-4 mt-4 border-b border-gray-300 pb-2 uppercase">{{ t('secNotify') }}</h4>
                     <div class="flex items-center gap-4 mb-4">
                         <span class="text-sm font-bold text-slate-700">{{ t('pushSwitch') }}</span>
                         <el-switch v-model="settingsForm.enableNotify" style="--el-switch-on-color:#2563eb;"></el-switch>
+                        <div v-if="settingsForm.enableNotify" class="ml-auto flex items-center gap-2">
+                            <span class="text-xs text-gray-500">{{ t('lblPushTitle') || 'Title' }}</span>
+                            <el-input v-model="settingsForm.notifyTitle" :placeholder="t('pushTitle')" size="small" class="!w-48"></el-input>
+                        </div>
                     </div>
                     
                     <div v-if="settingsForm.enableNotify">
@@ -2104,7 +2565,7 @@ const HTML = `<!DOCTYPE html>
                             <el-collapse-item name="ntfy">
                                 <template #title>
                                     <div class="flex items-center w-full pr-4">
-                                        <el-icon class="mr-2 text-lg"><Promotion /></el-icon>
+                                        <el-icon class="mr-2 text-lg"><Position /></el-icon>
                                         <span class="font-bold flex-1">Ntfy</span>
                                         <el-switch v-model="channelMap.ntfy" style="--el-switch-on-color:#2563eb;" @change="toggleChannel('ntfy')" @click.stop></el-switch>
                                     </div>
@@ -2121,7 +2582,7 @@ const HTML = `<!DOCTYPE html>
                             <el-collapse-item name="pushplus">
                                 <template #title>
                                     <div class="flex items-center w-full pr-4">
-                                        <el-icon class="mr-2 text-lg"><Message /></el-icon>
+                                        <el-icon class="mr-2 text-lg"><Comment /></el-icon>
                                         <span class="font-bold flex-1">PushPlus</span>
                                         <el-switch v-model="channelMap.pushplus" style="--el-switch-on-color:#2563eb;" @change="toggleChannel('pushplus')" @click.stop></el-switch>
                                     </div>
@@ -2136,7 +2597,7 @@ const HTML = `<!DOCTYPE html>
                             <el-collapse-item name="notifyx">
                                 <template #title>
                                     <div class="flex items-center w-full pr-4">
-                                        <el-icon class="mr-2 text-lg"><Bell /></el-icon>
+                                        <el-icon class="mr-2 text-lg"><Notification /></el-icon>
                                         <span class="font-bold flex-1">NotifyX</span>
                                         <el-switch v-model="channelMap.notifyx" style="--el-switch-on-color:#2563eb;" @change="toggleChannel('notifyx')" @click.stop></el-switch>
                                     </div>
@@ -2168,7 +2629,7 @@ const HTML = `<!DOCTYPE html>
                             <el-collapse-item name="webhook">
                                 <template #title>
                                     <div class="flex items-center w-full pr-4">
-                                        <el-icon class="mr-2 text-lg"><Link /></el-icon>
+                                        <el-icon class="mr-2 text-lg"><Connection /></el-icon>
                                         <span class="font-bold flex-1">Webhook 1</span>
                                         <el-switch v-model="channelMap.webhook" style="--el-switch-on-color:#2563eb;" @change="toggleChannel('webhook')" @click.stop></el-switch>
                                     </div>
@@ -2185,7 +2646,7 @@ const HTML = `<!DOCTYPE html>
                             <el-collapse-item name="webhook2">
                                 <template #title>
                                     <div class="flex items-center w-full pr-4">
-                                        <el-icon class="mr-2 text-lg"><Link /></el-icon>
+                                        <el-icon class="mr-2 text-lg"><Connection /></el-icon>
                                         <span class="font-bold flex-1">Webhook 2</span>
                                         <el-switch v-model="channelMap.webhook2" style="--el-switch-on-color:#2563eb;" @change="toggleChannel('webhook2')" @click.stop></el-switch>
                                     </div>
@@ -2202,7 +2663,7 @@ const HTML = `<!DOCTYPE html>
                             <el-collapse-item name="webhook3">
                                 <template #title>
                                     <div class="flex items-center w-full pr-4">
-                                        <el-icon class="mr-2 text-lg"><Link /></el-icon>
+                                        <el-icon class="mr-2 text-lg"><Connection /></el-icon>
                                         <span class="font-bold flex-1">Webhook 3</span>
                                         <el-switch v-model="channelMap.webhook3" style="--el-switch-on-color:#2563eb;" @change="toggleChannel('webhook3')" @click.stop></el-switch>
                                     </div>
@@ -2249,14 +2710,178 @@ const HTML = `<!DOCTYPE html>
 					</div>
 
                     <h4 class="text-xs font-bold text-blue-600 mb-4 mt-8 border-b border-gray-300 pb-2 uppercase">{{ t('secData') }}</h4>
-                    <div class="flex gap-4">
+                    <div class="flex gap-4 mb-4">
                         <el-button type="success" plain :icon="Download" class="flex-1 mecha-btn" @click="exportData">{{ t('btnExport') }}</el-button>
                         <el-button type="warning" plain :icon="Upload" class="flex-1 mecha-btn" @click="triggerImport">{{ t('btnImport') }}</el-button>
                         <input type="file" ref="importRef" style="display:none" accept=".json" @change="handleImportFile">
                     </div>
+                    <el-button type="info" plain class="w-full mecha-btn" @click="migrateOldData">
+                        {{ lang === 'zh' ? '升级旧数据 (生成初始账单)' : 'Migrate Old Data (Generate Initial Bills)' }}
+                    </el-button>
                 </el-form>
                 <template #footer><el-button @click="settingsVisible=false" size="large" class="mecha-btn">{{ t('cancel') }}</el-button><el-button type="primary" @click="saveSettings" size="large" class="mecha-btn !bg-blue-600">{{ t('saveSettings') }}</el-button></template>
             </el-dialog>
+
+            <!-- Renew Dialog (also used for Add History) -->
+            <el-dialog v-model="renewDialogVisible" :title="renewMode === 'addHistory' ? t('btnAddHist') : t('manualRenew')" width="500px" align-center class="mecha-panel !rounded-none">
+               <el-form label-position="top">
+                 <el-form-item :label="t('renewDate')">
+                    <el-date-picker v-model="renewForm.renewDate" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" style="width:100%" class="!w-full"></el-date-picker>
+                 </el-form-item>
+                 <el-form-item :label="t('billPeriod')">
+                     <template #label>
+                        {{t('billPeriod')}}
+                        <div class="inline-flex items-center gap-1 ml-2 align-middle">
+                            <span v-if="currentRenewItem.intervalDays" class="text-[9px] font-bold text-slate-500 bg-slate-50 border border-slate-200 px-1 py-[2px] leading-none whitespace-nowrap uppercase">
+                                {{ currentRenewItem.intervalDays }} {{ t('unit.' + (currentRenewItem.cycleUnit || 'day')) }}
+                            </span>
+                            <span v-if="currentRenewItem.useLunar" class="text-[9px] font-bold text-purple-600 bg-purple-50 border border-purple-200 px-1 py-[2px] leading-none whitespace-nowrap">
+                                {{ t('lunarCal') }}
+                            </span>
+                        </div>
+                     </template>
+                     <div class="flex items-center gap-4">
+                         <div class="flex-1 min-w-0">
+                             <el-date-picker v-if="currentRenewItem.useLunar" v-model="renewForm.startDate" type="date" value-format="YYYY-MM-DD" :placeholder="t('startDate')" style="width:100%" :clearable="false" popper-class="lunar-popper" :disabled="renewMode === 'renew' && currentRenewItem.type === 'cycle'"><template #default="c"><div class="lunar-cell"><el-tooltip :content="getLunarTooltip(c)" placement="top" :hide-after="0" :enterable="false"><div class="view-date"><span class="solar font-bold">{{c.text}}</span><span class="lunar">{{getSmartLunarText(c)}}</span></div></el-tooltip><div class="view-month">{{getMonthStr(c.text)}}</div><div class="view-year"><span class="y-num">{{c.text}}</span><span class="y-ganzhi">{{getYearGanZhi(c.text)}}</span></div></div></template></el-date-picker>
+                             <el-date-picker v-else v-model="renewForm.startDate" type="date" value-format="YYYY-MM-DD" :placeholder="t('startDate')" style="width:100%" :clearable="false" popper-class="lunar-popper" :disabled="renewMode === 'renew' && currentRenewItem.type === 'cycle'"><template #default="c"><div class="lunar-cell"><div class="view-date"><span class="solar font-bold">{{c.text}}</span></div><div class="view-month">{{getMonthStr(c.text)}}</div><div class="view-year"><span class="y-num">{{c.text}}</span></div></div></template></el-date-picker>
+                             <div v-if="currentRenewItem.useLunar" class="text-xs text-purple-600 mt-1 font-mono">{{ getLunarStr(renewForm.startDate) }}</div>
+                         </div>
+                         <span class="text-gray-400 flex-shrink-0">-</span>
+                         <div class="flex-1 min-w-0">
+                             <el-date-picker v-if="currentRenewItem.useLunar" v-model="renewForm.endDate" type="date" value-format="YYYY-MM-DD" :placeholder="t('endDate')" style="width:100%" :clearable="false" popper-class="lunar-popper" :disabled="renewMode === 'renew' && currentRenewItem.type === 'cycle'"><template #default="c"><div class="lunar-cell"><el-tooltip :content="getLunarTooltip(c)" placement="top" :hide-after="0" :enterable="false"><div class="view-date"><span class="solar font-bold">{{c.text}}</span><span class="lunar">{{getSmartLunarText(c)}}</span></div></el-tooltip><div class="view-month">{{getMonthStr(c.text)}}</div><div class="view-year"><span class="y-num">{{c.text}}</span><span class="y-ganzhi">{{getYearGanZhi(c.text)}}</span></div></div></template></el-date-picker>
+                             <el-date-picker v-else v-model="renewForm.endDate" type="date" value-format="YYYY-MM-DD" :placeholder="t('endDate')" style="width:100%" :clearable="false" popper-class="lunar-popper" :disabled="renewMode === 'renew' && currentRenewItem.type === 'cycle'"><template #default="c"><div class="lunar-cell"><div class="view-date"><span class="solar font-bold">{{c.text}}</span></div><div class="view-month">{{getMonthStr(c.text)}}</div><div class="view-year"><span class="y-num">{{c.text}}</span></div></div></template></el-date-picker>
+                             <div v-if="currentRenewItem.useLunar" class="text-xs text-purple-600 mt-1 font-mono">{{ getLunarStr(renewForm.endDate) }}</div>
+                         </div>
+                     </div>
+                 </el-form-item>
+                 <div class="grid grid-cols-2 gap-4">
+                     <el-form-item :label="t('actualPrice')">
+                         <el-input-number v-model="renewForm.price" :precision="2" style="width:100%" class="!w-full" controls-position="right"></el-input-number>
+                     </el-form-item>
+                     <el-form-item :label="t('currency')">
+                         <el-select v-model="renewForm.currency" filterable class="!w-full">
+                             <el-option v-for="c in currencyList" :key="c" :label="c" :value="c"></el-option>
+                         </el-select>
+                     </el-form-item>
+                 </div>
+                 <el-form-item :label="t('note')">
+                     <el-input v-model="renewForm.note" type="textarea" :placeholder="t('notePlaceholder')"></el-input>
+                 </el-form-item>
+               </el-form>
+               <template #footer>
+                  <el-button @click="renewDialogVisible=false">{{t('cancel')}}</el-button>
+                  <el-button type="primary" @click="submitRenew" :loading="submitting">{{t('yes')}}</el-button>
+               </template>
+            </el-dialog>
+
+            <!-- History Dialog -->
+<el-dialog v-model="historyDialogVisible" :title="currentHistoryItem.name + ' - ' + t('historyTitle')" width="700px" align-center class="mecha-panel !rounded-none" style="clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);">
+                <div class="mb-6 bg-slate-50 dark:bg-slate-800 p-4 rounded border border-slate-100 dark:border-slate-700 relative flex items-center justify-between">
+                     <div class="flex items-center gap-6 flex-wrap">
+                         <div class="flex items-center gap-2">
+                             <div class="text-[10px] text-gray-400 uppercase font-bold tracking-widest">{{t('totalCost')}}</div> 
+                             <div class="font-black text-xl font-mono text-blue-600 dark:text-blue-400 leading-none">{{historyStats.convertedTotal}} <span class="text-xs text-gray-400 font-bold">{{historyStats.preferredCurrency}}</span></div>
+                         </div>
+                         <div v-if="Object.keys(historyStats.byCurrency).length > 1" class="flex items-center gap-2 flex-wrap">
+                             <span v-for="(amount, cur) in historyStats.byCurrency" :key="cur" class="text-xs font-mono text-gray-500 bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded">{{amount.toFixed(2)}} {{cur}}</span>
+                         </div>
+                         <div class="w-px h-6 bg-slate-200 dark:bg-slate-700"></div>
+                         <div class="flex items-center gap-2">
+                             <div class="text-[10px] text-gray-400 uppercase font-bold tracking-widest">{{t('totalCount')}}</div> 
+                             <div class="font-black text-xl font-mono text-amber-500 leading-none">{{historyStats.count}}</div>
+                         </div>
+                     </div>
+                     <el-tooltip :content="t('btnAddHist')" placement="left">
+                         <el-button type="success" circle plain @click="addHistoryRecord" :icon="Plus" class="!border-emerald-200 !text-emerald-600 hover:!bg-emerald-50"></el-button>
+                     </el-tooltip>
+                </div>
+                
+                <div class="max-h-[500px] overflow-y-auto px-1">
+                    <el-timeline v-if="pagedHistory.length > 0">
+                        <el-timeline-item v-for="(item, index) in pagedHistory" :key="index" :type="index===0?'primary':''" :hollow="index!==0" :timestamp="formatLogTime(item.renewDate)" placement="top" hide-timestamp>
+                            
+                            <div class="mecha-panel p-3 mb-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:shadow-md transition-shadow relative group">
+                                
+                                <div v-if="editingHistoryIndex !== index">
+                                    <div class="flex justify-between items-center mb-2 border-b border-slate-100 dark:border-slate-800 pb-1">
+                                        <div class="flex items-center gap-2">
+                                            <span class="font-mono text-base font-bold text-slate-700 dark:text-slate-200 tracking-tight">
+                                                {{ item.renewDate ? item.renewDate.substring(0, 16) : 'N/A' }}
+                                            </span>
+                                            <span v-if="index===0 && historyPage===1" class="text-[9px] bg-blue-100 text-blue-600 px-1.5 py-0.5 rounded-sm font-bold">{{ t('tagLatest') }}</span>
+                                            <span v-if="item.note && (item.note.includes('Auto') || item.note.includes('自动'))" class="text-[9px] bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded-sm font-bold">{{ t('tagAuto') }}</span>
+                                            <span v-else class="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-sm font-bold">{{ t('tagManual') }}</span>
+                                        </div>
+                                        <div class="flex gap-1">
+                                            <el-button type="primary" link size="small" @click="startEditHistory(index, item)" :icon="Edit"></el-button>
+                                            <el-popconfirm :title="t('msg.confirmDel')" @confirm="removeHistoryRecord(index)">
+                                                <template #reference><el-button type="danger" link size="small" :icon="Delete"></el-button></template>
+                                            </el-popconfirm>
+                                        </div>
+                                    </div>
+
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <div class="flex items-center gap-2 flex-1">
+                                            <span class="text-xs text-gray-400 uppercase font-bold">{{ t('billPeriod') }}</span>
+                                            <div class="font-mono text-sm font-bold text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-800 inline-block px-2 py-0.5 border border-slate-200 dark:border-slate-700 rounded-sm">
+                                                {{ item.startDate }} <span class="mx-1 text-gray-300">-></span> {{ item.endDate }}
+                                            </div>
+                                        </div>
+                                        <div class="text-lg font-black font-mono text-blue-600 dark:text-blue-400 leading-none">{{ item.price }} <span class="text-xs font-bold text-gray-400">{{ item.currency }}</span></div>
+                                    </div>
+
+                                    <div class="flex items-start gap-3" v-if="item.note && !item.note.includes('Auto')">
+                                        <div class="text-xs text-gray-500 dark:text-gray-400 font-mono mt-0.5 break-all">
+                                            📝 {{ item.note }}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div v-else class="bg-blue-50/50 dark:bg-slate-800/50 -m-2 p-4 border border-blue-200 dark:border-blue-800 relative">
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+                                        <div>
+                                            <div class="text-[10px] text-blue-500 font-bold mb-1">{{ t('opDate') }}</div>
+                                            <el-date-picker v-model="tempHistoryItem.renewDate" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" size="small" style="width:100%" :clearable="false"></el-date-picker>
+                                        </div>
+                                        <div>
+                                            <div class="text-[10px] text-blue-500 font-bold mb-1">{{ t('amount') }}</div>
+                                            <div class="flex gap-2">
+                                                <el-input-number v-model="tempHistoryItem.price" :min="0" :precision="2" :controls="false" size="small" style="flex:1"></el-input-number>
+                                                <el-select v-model="tempHistoryItem.currency" size="small" style="width:80px">
+                                                    <el-option v-for="c in currencyList" :key="c" :label="c" :value="c"></el-option>
+                                                </el-select>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="mb-3 opacity-60">
+                                        <div class="text-[10px] text-gray-500 font-bold mb-1">{{ t('billPeriod') }} ({{ t('readOnly') }})</div>
+                                        <div class="flex items-center gap-2">
+                                            <el-input v-model="tempHistoryItem.startDate" size="small" disabled class="!w-32"></el-input>
+                                            <span class="text-gray-400">-</span>
+                                            <el-input v-model="tempHistoryItem.endDate" size="small" disabled class="!w-32"></el-input>
+                                        </div>
+                                    </div>
+                                    <div class="mb-3">
+                                        <div class="text-[10px] text-blue-500 font-bold mb-1">{{ t('note') }}</div>
+                                        <el-input v-model="tempHistoryItem.note" size="small" placeholder="Optional note..."></el-input>
+                                    </div>
+                                    <div class="flex justify-end gap-2 mt-4 pt-3 border-t border-blue-100 dark:border-blue-900">
+                                        <el-button size="small" text @click="cancelEditHistory">{{ t('cancel') }}</el-button>
+                                        <el-button size="small" type="primary" @click="saveEditHistory(index)">{{ t('save') }}</el-button>
+                                    </div>
+                                </div>
+
+                            </div>
+                        </el-timeline-item>
+                    </el-timeline>
+                    <el-empty v-else :description="t('noLogs')"></el-empty>
+                </div>
+
+                <div class="mt-4 flex justify-end" v-if="currentHistoryItem.renewHistory.length > historyPageSize">
+                     <el-pagination layout="prev, pager, next" :total="currentHistoryItem.renewHistory.length" :page-size="historyPageSize" v-model:current-page="historyPage" hide-on-single-page background small></el-pagination>
+                </div>
+            </el-dialog>
+
 
             <el-drawer v-model="historyVisible" :title="t('sysLogs')" :size="drawerSize">
                 <div class="p-6" v-loading="historyLoading">
@@ -2289,7 +2914,7 @@ const HTML = `<!DOCTYPE html>
     <script>
         const { createApp, ref, computed, onMounted, onUnmounted, nextTick, reactive,watch } = Vue;
         const { ElMessage, ElMessageBox } = ElementPlus;
-        const { Edit, Delete, Plus, VideoPlay, Setting, Bell, Document, Lock, Monitor, SwitchButton, Calendar, Timer, Files, AlarmClock, Warning, Search, Cpu, Upload, Download, Link, Message, Promotion, Iphone, Moon, Sunny, RefreshRight, More, ArrowDown } = ElementPlusIconsVue;
+        const { Edit, Delete, Plus, VideoPlay, Setting, Bell, Document, Lock, Monitor, SwitchButton, Calendar, Timer, Files, AlarmClock, Warning, Search, Cpu, Upload, Download, Link, Connection, Message, Promotion, Iphone, Moon, Sunny, RefreshRight, More, ArrowDown, Tickets } = ElementPlusIconsVue;
         const ZhCn = window.ElementPlusLocaleZhCn || {};
         const frontendCalc = {
             l2s(l) {
@@ -2334,23 +2959,26 @@ const HTML = `<!DOCTYPE html>
             }
         };
         const messages = {
-            zh: { filter:{expired:'已过期 / 今天', w7:'7天内', w30:'30天内', future:'远期(>30天)', new:'新服务 (<30天)', stable:'稳定 (1个月-1年)', long:'长期 (>1年)', m1:'最近1个月', m6:'半年内', year:'今年内', earlier:'更早以前'}, secPref: '偏好设置',manualRenew: '手动续期',tipToggle: '切换状态',tipRenew: '手动续期',tipEdit: '编辑服务',tipDelete: '删除服务',secNotify: '通知配置',secData: '数据管理',lblIcsTitle: '日历订阅',lblIcsUrl: '订阅地址 (iOS/Google)',btnCopy: '复制',btnResetToken: '重置令牌',loginTitle:'身份验证',passwordPlaceholder:'请输入访问密钥/Authorization Key',unlockBtn:'解锁终端/UNLOCK',check:'立即检查',add:'新增服务',settings:'系统设置',logs:'运行日志',logout:'安全退出',totalServices:'服务总数',expiringSoon:'即将到期',expiredAlert:'已过期 / 警告',serviceName:'服务名称',type:'类型',nextDue:'下次到期',uptime:'已运行',lastRenew:'上次续期',cyclePeriod:'周期',actions:'操作',cycle:'循环订阅',reset:'到期重置',disabled:'已停用',days:'天',daysUnit:'天',typeReset:'到期重置',typeCycle:'循环订阅',lunarCal:'农历',lbOffline:'离线',unit:{day:'天',month:'月',year:'年'},editService:'编辑服务',newService:'新增服务',formName:'名称',namePlaceholder:'例如: Netflix',formType:'模式',createDate:'创建时间',interval:'周期时长',note:'备注信息',status:'状态',active:'启用',disabledText:'禁用',cancel:'取消',save:'保存数据',saveSettings:'保存配置',settingsTitle:'系统设置',setNotify:'通知配置',pushSwitch:'推送总开关',pushUrl:'Webhook 地址',notifyThreshold:'提醒阈值',setAuto:'自动化配置',autoRenewSwitch:'自动续期',autoRenewThreshold:'自动续期阈值',autoDisableThreshold:'自动禁用阈值',daysOverdue:'天后触发',sysLogs:'系统日志',execLogs:'执行记录',clearHistory:'清空历史',noLogs:'无记录',liveLog:'实时终端',btnExport: '导出备份',btnImport: '恢复备份',btnTest: '发送测试',btnRefresh:'刷新日志',
+            zh: { upcomingBillsDays:'待付款提醒天数', upcomingBills: '%s日内待付款项', filter:{expired:'已过期 / 今天', w7:'%s天内', w30:'30天内', thisMonth:'本月内', nextMonth:'下月内', halfYear:'半年内', oneYear:'1年内', new:'新服务 (<30天)', stable:'稳定 (1个月-1年)', long:'长期 (>1年)', m1:'最近1个月', m6:'半年内', year:'今年内', earlier:'更早以前'}, viewSwitch:'视图切换',viewProjects:'项目列表',viewSpending:'支出分析',annualSummary:'年度汇总',monthlyTrend:'月度趋势',noSpendingData:'暂无支出数据',avgMonthly:'月均',billAmount:'账单金额 (按账单周期)',opSpending:'实际支出 (按操作日期)',secPref: '偏好设置',manualRenew: '手动续期',tipToggle: '切换状态',tipRenew: '手动续期',tipEdit: '编辑服务',tipDelete: '删除服务',secNotify: '通知配置',secData: '数据管理',lblIcsTitle: '日历订阅',lblIcsUrl: '订阅地址 (iOS/Google)',btnCopy: '复制',btnResetToken: '重置令牌',loginTitle:'身份验证',passwordPlaceholder:'请输入访问密钥/Authorization Key',unlockBtn:'解锁终端/UNLOCK',check:'立即检查',add:'新增服务',settings:'系统设置',logs:'运行日志',logout:'安全退出',totalServices:'服务总数',expiringSoon:'即将到期',expiredAlert:'已过期 / 警告',serviceName:'服务名称',type:'类型',nextDue:'下次到期',uptime:'已运行',lastRenew:'上次续期',cyclePeriod:'周期',actions:'操作',cycle:'循环订阅',reset:'到期重置',disabled:'已停用',days:'天',daysUnit:'天',typeReset:'到期重置',typeCycle:'循环订阅',lunarCal:'农历',lbOffline:'离线',unit:{day:'天',month:'月',year:'年'},editService:'编辑服务',newService:'新增服务',formName:'名称',namePlaceholder:'例如: Netflix',formType:'模式',createDate:'创建时间',interval:'周期时长',note:'备注信息',status:'状态',active:'启用',disabledText:'禁用',cancel:'取消',save:'保存数据',saveSettings:'保存配置',settingsTitle:'系统设置',setNotify:'通知配置',pushSwitch:'推送总开关',pushUrl:'Webhook 地址',notifyThreshold:'提醒阈值',setAuto:'自动化配置',autoRenewSwitch:'自动续期',autoRenewThreshold:'自动续期阈值',autoDisableThreshold:'自动禁用阈值',daysOverdue:'天后触发',sysLogs:'系统日志',execLogs:'执行记录',clearHistory:'清空历史',noLogs:'无记录',liveLog:'实时终端',btnExport: '导出备份',btnImport: '恢复备份',btnTest: '发送测试',btnRefresh:'刷新日志',
             lblEnable: '启用', lblToken: '令牌 (Token)', lblApiKey: 'API Key', lblChatId: '会话ID', 
             lblServer: '服务器URL', lblDevKey: '设备Key', lblFrom: '发件人', lblTo: '收件人',
-            lblTopic: '主题 (Topic)',
+            lblTopic: '主题 (Topic)',readOnly: '只读',
             lblNotifyTime: '提醒时间', btnResetToken: '重置令牌',
             lblHeaders: '请求头 (JSON)', lblBody: '消息体 (JSON)',
-            tag:{alert:'触发提醒',renew:'自动续期',disable:'自动禁用',normal:'检查正常'},msg:{confirmRenew: '确认将 [%s] 的更新日期设置为今天吗？',renewSuccess: '续期成功！日期已更新: %s -> %t',tokenReset: '令牌已重置，请更新订阅地址', copyOk: '链接已复制', exportSuccess: '备份已下载',importSuccess: '数据恢复成功，即将刷新',importFail: '导入失败，请检查文件格式',passReq:'请输入密码',saved:'保存成功',saveFail:'保存失败',cleared:'已清空',clearFail:'清空失败',loginFail:'验证失败',loadLogFail:'日志加载失败',confirmDel:'确认删除此项目?',dateError:'上次更新日期不能早于创建日期',nameReq:'服务名称不能为空',nameExist:'服务名称已存在',futureError:'上次续期不能是未来时间',serviceDisabled:'服务已停用',serviceEnabled:'服务已启用',execFinish: '执行完毕!'},tags:'标签',tagPlaceholder:'输入标签回车创建',searchPlaceholder:'搜索标题或备注...',tagsCol:'标签',tagAll:'全部',useLunar:'农历周期',lunarTip:'按农历日期计算周期',yes:'是',no:'否',timezone:'偏好时区',disabledFilter:'已停用',policyConfig:'自动化策略',policyNotify:'提醒提前期',policyAuto:'自动续期',policyRenewDay:'过期续期天数',useGlobal:'全局默认',autoRenewOnDesc:'过期自动续期',autoRenewOffDesc:'过期自动禁用',previewCalc:'根据上次续期日期和周期计算',nextDue:'下次到期'},
-            en: { filter:{expired:'Overdue/Today', w7:'Within 7 Days', w30:'Within 30 Days', future:'Future(>30d)', new:'New (<30d)', stable:'Stable (1m-1y)', long:'Long Term (>1y)', m1:'Last Month', m6:'Last 6 Months', year:'This Year', earlier:'Earlier'}, secPref: 'PREFERENCES',manualRenew: 'Quick Renew',tipToggle: 'Toggle Status',tipRenew: 'Quick Renew',tipEdit: 'Edit Service',tipDelete: 'Delete Service',secNotify: 'NOTIFICATIONS',secData: 'DATA MANAGEMENT',lblIcsTitle: 'CALENDAR SUBSCRIPTION',lblIcsUrl: 'ICS URL (iOS/Google Calendar)',btnCopy: 'COPY',btnResetToken: 'RESET TOKEN',loginTitle:'SYSTEM ACCESS',passwordPlaceholder:'Authorization Key',unlockBtn:'UNLOCK TERMINAL',check:'CHECK',add:'ADD NEW',settings:'CONFIG',logs:'LOGS',logout:'LOGOUT',totalServices:'TOTAL SERVICES',expiringSoon:'EXPIRING SOON',expiredAlert:'EXPIRED / ALERT',serviceName:'SERVICE NAME',type:'TYPE',nextDue:'NEXT DUE',uptime:'UPTIME',lastRenew:'LAST RENEW',cyclePeriod:'CYCLE',actions:'ACTIONS',cycle:'CYCLE',reset:'RESET',disabled:'DISABLED',days:'DAYS',daysUnit:'DAYS',typeReset:'RESET',typeCycle:'CYCLE',lunarCal:'Lunar',lbOffline:'OFFLINE',unit:{day:'DAY',month:'MTH',year:'YR'},editService:'EDIT SERVICE',newService:'NEW SERVICE',formName:'NAME',namePlaceholder:'e.g. Netflix',formType:'MODE',createDate:'CREATE DATE',interval:'INTERVAL',note:'NOTE',status:'STATUS',active:'ACTIVE',disabledText:'DISABLED',cancel:'CANCEL',save:'SAVE DATA',saveSettings:'SAVE CONFIG',settingsTitle:'SYSTEM CONFIG',setNotify:'NOTIFICATION',pushSwitch:'MASTER PUSH',pushUrl:'WEBHOOK URL',notifyThreshold:'ALERT THRESHOLD',setAuto:'AUTOMATION',autoRenewSwitch:'AUTO RENEW',autoRenewThreshold:'RENEW AFTER',autoDisableThreshold:'DISABLE AFTER',daysOverdue:'DAYS OVERDUE',sysLogs:'SYSTEM LOGS',execLogs:'EXECUTION LOGS',clearHistory:'CLEAR HISTORY',noLogs:'NO DATA',liveLog:'LIVE TERMINAL',btnExport: 'Export Data',btnImport: 'Import Data',btnTest: 'Send Test',btnRefresh:'REFRESH',
+            tag:{alert:'触发提醒',renew:'自动续期',disable:'自动禁用',normal:'检查正常'},tagLatest:'最新',tagAuto:'自动',tagManual:'手动',msg:{confirmRenew: '确认将 [%s] 的更新日期设置为今天吗？',renewSuccess: '续期成功！日期已更新: %s -> %t',tokenReset: '令牌已重置，请更新订阅地址', copyOk: '链接已复制', exportSuccess: '备份已下载',importSuccess: '数据恢复成功，即将刷新',importFail: '导入失败，请检查文件格式',passReq:'请输入密码',saved:'保存成功',saveFail:'保存失败',cleared:'已清空',clearFail:'清空失败',loginFail:'验证失败',loadLogFail:'日志加载失败',confirmDel:'确认删除此项目?',dateError:'上次更新日期不能早于创建日期',nameReq:'服务名称不能为空',nameExist:'服务名称已存在',futureError:'上次续期不能是未来时间',serviceDisabled:'服务已停用',serviceEnabled:'服务已启用',execFinish: '执行完毕!'},tags:'标签',tagPlaceholder:'输入标签回车创建',searchPlaceholder:'搜索标题或备注...',tagsCol:'标签',tagAll:'全部',useLunar:'农历周期',lunarTip:'按农历日期计算周期',yes:'是',no:'否',timezone:'偏好时区',disabledFilter:'已停用',policyConfig:'自动化策略',policyNotify:'提醒提前期',policyAuto:'自动续期',policyRenewDay:'过期续期天数',useGlobal:'全局默认',autoRenewOnDesc:'过期自动续期',autoRenewOffDesc:'过期自动禁用',previewCalc:'根据上次续期日期和周期计算',nextDue:'下次到期',
+            fixedPrice:'账单额',currency:'币种',defaultCurrency:'默认币种',history:'历史记录',historyTitle:'续费历史',totalCost:'总花费',totalCount:'续费次数',renewDate:'操作日期',billPeriod:'账单周期',startDate:'开始日期',endDate:'结束日期',actualPrice:'实付金额',notePlaceholder:'可选备注...',btnAddHist:'补录历史',modify:'修改',confirmDelHist:'删除此记录?',opDate:'操作日',amount:'金额',period:'周期',spendingDashboard:'花销看板',monthlyBreakdown:'月度明细',total:'总计',count:'笔',growth:'环比',currMonth:'本月',avgMonthlyLabel:'月均支出',itemDetails:'项目明细',noData:'暂无数据',predictedTag:'预测',last12M:'最近12个月', lblPushTitle:'自定义标题', pushTitle:'RenewHelper 报告'},
+            en: { upcomingBillsDays:'Pending Reminder', upcomingBills: '%s Days Pending', viewSwitch:'VIEW SWITCH',viewProjects:'PROJECTS',viewSpending:'DASHBOARD',annualSummary:'Annual Summary',monthlyTrend:'Monthly Trend',noSpendingData:'No Spending Data',billAmount:'BILL AMOUNT',opSpending:'ACTUAL COST', avgMonthly:'AVG', avgMonthlyLabel:'AVG MONTHLY', filter:{expired:'Overdue/Today', w7:'Within %s Days', w30:'Within 30 Days', future:'Future(>30d)', new:'New (<30d)', stable:'Stable (1m-1y)', long:'Long Term (>1y)', m1:'Last Month', m6:'Last 6 Months', year:'This Year', earlier:'Earlier'}, secPref: 'PREFERENCES',manualRenew: 'Quick Renew',tipToggle: 'Toggle Status',tipRenew: 'Quick Renew',tipEdit: 'Edit Service',tipDelete: 'Delete Service',secNotify: 'NOTIFICATIONS',secData: 'DATA MANAGEMENT',lblIcsTitle: 'CALENDAR SUBSCRIPTION',lblIcsUrl: 'ICS URL (iOS/Google Calendar)',btnCopy: 'COPY',btnResetToken: 'RESET TOKEN',loginTitle:'SYSTEM ACCESS',passwordPlaceholder:'Authorization Key',unlockBtn:'UNLOCK TERMINAL',check:'CHECK',add:'ADD NEW',settings:'CONFIG',logs:'LOGS',logout:'LOGOUT',totalServices:'TOTAL SERVICES',expiringSoon:'EXPIRING SOON',expiredAlert:'EXPIRED / ALERT',serviceName:'SERVICE NAME',type:'TYPE',nextDue:'NEXT DUE',uptime:'UPTIME',lastRenew:'LAST RENEW',cyclePeriod:'CYCLE',actions:'ACTIONS',cycle:'CYCLE',reset:'RESET',disabled:'DISABLED',days:'DAYS',daysUnit:'DAYS',typeReset:'RESET',typeCycle:'CYCLE',lunarCal:'Lunar',lbOffline:'OFFLINE',unit:{day:'DAY',month:'MTH',year:'YR'},editService:'EDIT SERVICE',newService:'NEW SERVICE',formName:'NAME',namePlaceholder:'e.g. Netflix',formType:'MODE',createDate:'CREATE DATE',interval:'INTERVAL',note:'NOTE',status:'STATUS',active:'ACTIVE',disabledText:'DISABLED',cancel:'CANCEL',save:'SAVE DATA',saveSettings:'SAVE CONFIG',settingsTitle:'SYSTEM CONFIG',setNotify:'NOTIFICATION',pushSwitch:'MASTER PUSH',pushUrl:'WEBHOOK URL',notifyThreshold:'ALERT THRESHOLD',setAuto:'AUTOMATION',autoRenewSwitch:'AUTO RENEW',autoRenewThreshold:'RENEW AFTER',autoDisableThreshold:'DISABLE AFTER',daysOverdue:'DAYS OVERDUE',sysLogs:'SYSTEM LOGS',execLogs:'EXECUTION LOGS',clearHistory:'CLEAR HISTORY',noLogs:'NO DATA',liveLog:'LIVE TERMINAL',btnExport: 'Export Data',btnImport: 'Import Data',btnTest: 'Send Test',btnRefresh:'REFRESH',last12M:'LAST 12M',
             lblEnable: 'Enable', lblToken: 'Token', lblApiKey: 'API Key', lblChatId: 'Chat ID', 
             lblServer: 'Server URL', lblDevKey: 'Device Key', lblFrom: 'From Email', lblTo: 'To Email',
-            lblTopic: 'Topic',
+            lblTopic: 'Topic',readOnly: 'Read-only',
             lblNotifyTime: 'Alarm Time', btnResetToken: 'RESET TOKEN',
             lblHeaders: 'Headers (JSON)', lblBody: 'Body (JSON)',
-            tag:{alert:'ALERT',renew:'RENEWED',disable:'DISABLED',normal:'NORMAL'},msg:{confirmRenew: 'Renew [%s] to today based on your timezone?',renewSuccess: 'Renewed! Date updated: %s -> %t',tokenReset: 'Token Reset. Update your calendar apps.', copyOk: 'Link Copied', exportSuccess: 'Backup Downloaded',importSuccess: 'Restore Success, Refreshing...',importFail: 'Import Failed, Check File Format',passReq:'Password Required',saved:'Data Saved',saveFail:'Save Failed',cleared:'Cleared',clearFail:'Clear Failed',loginFail:'Access Denied',loadLogFail:'Load Failed',confirmDel:'Confirm Delete?',dateError:'Last renew date cannot be earlier than create date',nameReq:'Name Required',nameExist:'Name already exists',futureError:'Renew date cannot be in the future',serviceDisabled:'Service Disabled',serviceEnabled:'Service Enabled',execFinish: 'EXECUTION FINISHED!'},tags:'TAGS',tagPlaceholder:'Press Enter to create tag',searchPlaceholder:'Search...',tagsCol:'TAGS',tagAll:'ALL',useLunar:'Lunar Cycle',lunarTip:'Calculate based on Lunar calendar',yes:'Yes',no:'No',timezone:'Timezone',disabledFilter:'DISABLED',policyConfig:'Policy Config',policyNotify:'Notify Days',policyAuto:'Auto Renew',policyRenewDay:'Renew Days',useGlobal:'Global Default',autoRenewOnDesc:'Auto Renew when overdue',autoRenewOffDesc:'Auto Disable when overdue',previewCalc:'Based on Last Renew Date & Interval',nextDue:'NEXT DUE'}
+            tag:{alert:'ALERT',renew:'RENEWED',disable:'DISABLED',normal:'NORMAL'},tagLatest:'LATEST',tagAuto:'AUTO',tagManual:'MANUAL',msg:{confirmRenew: 'Renew [%s] to today based on your timezone?',renewSuccess: 'Renewed! Date updated: %s -> %t',tokenReset: 'Token Reset. Update your calendar apps.', copyOk: 'Link Copied', exportSuccess: 'Backup Downloaded',importSuccess: 'Restore Success, Refreshing...',importFail: 'Import Failed, Check File Format',passReq:'Password Required',saved:'Data Saved',saveFail:'Save Failed',cleared:'Cleared',clearFail:'Clear Failed',loginFail:'Access Denied',loadLogFail:'Load Failed',confirmDel:'Confirm Delete?',dateError:'Last renew date cannot be earlier than create date',nameReq:'Name Required',nameExist:'Name already exists',futureError:'Renew date cannot be in the future',serviceDisabled:'Service Disabled',serviceEnabled:'Service Enabled',execFinish: 'EXECUTION FINISHED!'},tags:'TAGS',tagPlaceholder:'Press Enter to create tag',searchPlaceholder:'Search...',tagsCol:'TAGS',tagAll:'ALL',useLunar:'Lunar Cycle',lunarTip:'Calculate based on Lunar calendar',yes:'Yes',no:'No',timezone:'Timezone',disabledFilter:'DISABLED',policyConfig:'Policy Config',policyNotify:'Notify Days',policyAuto:'Auto Renew',policyRenewDay:'Renew Days',useGlobal:'Global Default',autoRenewOnDesc:'Auto Renew when overdue',autoRenewOffDesc:'Auto Disable when overdue',previewCalc:'Based on Last Renew Date & Interval',nextDue:'NEXT DUE',
+            fixedPrice:'PRICE',currency:'Currency',defaultCurrency:'Default Currency',history:'History',historyTitle:'Renewal History',totalCost:'Total Cost',totalCount:'Total Count',renewDate:'Op Date',billPeriod:'Bill Period',startDate:'Start Date',endDate:'End Date',actualPrice:'Actual Price',notePlaceholder:'Optional note...',btnAddHist:'Add Record',modify:'Edit',confirmDelHist:'Delete record?',opDate:'Op Date',amount:'Amount',period:'Period',spendingDashboard:'SPENDING DASHBOARD',monthlyBreakdown:'MONTHLY BREAKDOWN',total:'TOTAL',count:'COUNT',growth:'GROWTH',currMonth:'CURRENT',itemDetails:'ITEMS',noData:'NO DATA',predictedTag:'PREDICTED', lblPushTitle:'Push Title', pushTitle:'RenewHelper Report'}
         };
         const LUNAR={info:[0x04bd8,0x04ae0,0x0a570,0x054d5,0x0d260,0x0d950,0x16554,0x056a0,0x09ad0,0x055d2,0x04ae0,0x0a5b6,0x0a4d0,0x0d250,0x1d255,0x0b540,0x0d6a0,0x0ada2,0x095b0,0x14977,0x04970,0x0a4b0,0x0b4b5,0x06a50,0x06d40,0x1ab54,0x02b60,0x09570,0x052f2,0x04970,0x06566,0x0d4a0,0x0ea50,0x06e95,0x05ad0,0x02b60,0x186e3,0x092e0,0x1c8d7,0x0c950,0x0d4a0,0x1d8a6,0x0b550,0x056a0,0x1a5b4,0x025d0,0x092d0,0x0d2b2,0x0a950,0x0b557,0x06ca0,0x0b550,0x15355,0x04da0,0x0a5b0,0x14573,0x052b0,0x0a9a8,0x0e950,0x06aa0,0x0aea6,0x0ab50,0x04b60,0x0aae4,0x0a570,0x05260,0x0f263,0x0d950,0x05b57,0x056a0,0x096d0,0x04dd5,0x04ad0,0x0a4d0,0x0d4d4,0x0d250,0x0d558,0x0b540,0x0b6a0,0x195a6,0x095b0,0x049b0,0x0a974,0x0a4b0,0x0b27a,0x06a50,0x06d40,0x0af46,0x0ab60,0x09570,0x04af5,0x04970,0x064b0,0x074a3,0x0ea50,0x06b58,0x055c0,0x0ab60,0x096d5,0x092e0,0x0c960,0x0d954,0x0d4a0,0x0da50,0x07552,0x056a0,0x0abb7,0x025d0,0x092d0,0x0cab5,0x0a950,0x0b4a0,0x0baa4,0x0ad50,0x055d9,0x04ba0,0x0a5b0,0x15176,0x052b0,0x0a930,0x07954,0x06aa0,0x0ad50,0x05b52,0x04b60,0x0a6e6,0x0a4e0,0x0d260,0x0ea65,0x0d530,0x05aa0,0x076a3,0x096d0,0x04bd7,0x04ad0,0x0a4d0,0x1d0b6,0x0d250,0x0d520,0x0dd45,0x0b5a0,0x056d0,0x055b2,0x049b0,0x0a577,0x0a4b0,0x0aa50,0x1b255,0x06d20,0x0ada0,0x14b63,0x09370,0x049f8,0x04970,0x064b0,0x168a6,0x0ea50,0x06b20,0x1a6c4,0x0aae0,0x0a2e0,0x0d2e3,0x0c960,0x0d557,0x0d4a0,0x0da50,0x05d55,0x056a0,0x0a6d0,0x055d4,0x052d0,0x0a9b8,0x0a950,0x0b4a0,0x0b6a6,0x0ad50,0x055a0,0x0aba4,0x0a5b0,0x052b0,0x0b273,0x06930,0x07337,0x06aa0,0x0ad50,0x14b55,0x04b60,0x0a570,0x054e4,0x0d160,0x0e968,0x0d520,0x0daa0,0x16aa6,0x056d0,0x04ae0,0x0a9d4,0x0a2d0,0x0d150,0x0f252,0x0d520],gan:'甲乙丙丁戊己庚辛壬癸'.split(''),zhi:'子丑寅卯辰巳午未申酉戌亥'.split(''),months:'正二三四五六七八九十冬腊'.split(''),days:'初一,初二,初三,初四,初五,初六,初七,初八,初九,初十,十一,十二,十三,十四,十五,十六,十七,十八,十九,二十,廿一,廿二,廿三,廿四,廿五,廿六,廿七,廿八,廿九,三十'.split(','),lYearDays(y){let s=348;for(let i=0x8000;i>0x8;i>>=1)s+=(this.info[y-1900]&i)?1:0;return s+this.leapDays(y)},leapDays(y){if(this.leapMonth(y))return(this.info[y-1900]&0x10000)?30:29;return 0},leapMonth(y){return this.info[y-1900]&0xf},monthDays(y,m){return(this.info[y-1900]&(0x10000>>m))?30:29},solar2lunar(y,m,d){if(y<1900||y>2100)return null;const base=new Date(1900,0,31),obj=new Date(y,m-1,d);let offset=Math.round((obj-base)/86400000);let ly=1900,temp=0;for(;ly<2101&&offset>0;ly++){temp=this.lYearDays(ly);offset-=temp}if(offset<0){offset+=temp;ly--}let lm=1,leap=this.leapMonth(ly),isLeap=false;for(;lm<13&&offset>0;lm++){if(leap>0&&lm===(leap+1)&&!isLeap){--lm;isLeap=true;temp=this.leapDays(ly)}else{temp=this.monthDays(ly,lm)}if(isLeap&&lm===(leap+1))isLeap=false;offset-=temp}if(offset===0&&leap>0&&lm===leap+1){if(isLeap)isLeap=false;else{isLeap=true;--lm}}if(offset<0){offset+=temp;--lm}const ld=offset+1,gIdx=(ly-4)%10,zIdx=(ly-4)%12;const yStr=this.gan[gIdx<0?gIdx+10:gIdx]+this.zhi[zIdx<0?zIdx+12:zIdx];const mStr=(isLeap?'闰':'')+this.months[lm-1]+'月';return{year:ly,month:lm,day:ld,isLeap,yearStr:yStr,monthStr:mStr,dayStr:this.days[ld-1],fullStr:yStr+'年'+mStr+this.days[ld-1]}}};
         
+
         // 本地时间解析函数，防止时区偏差
         const parseYMD = (s) => { 
             if(!s) return new Date(); 
@@ -2358,19 +2986,60 @@ const HTML = `<!DOCTYPE html>
             return new Date(p[0], p[1]-1, p[2]); 
         };
 
-        createApp({
+        // Date calculation logic shared between validation and auto-fill
+        const calculateCycleEndDate = (startDateStr, item) => {
+            if (!startDateStr || !item || !item.intervalDays) return null;
+            
+            try {
+                if (item.useLunar && typeof frontendCalc !== 'undefined' && frontendCalc.addPeriod) {
+                    const p = startDateStr.split('-');
+                    const y = parseInt(p[0]), m = parseInt(p[1]), d = parseInt(p[2]);
+                    const l = LUNAR.solar2lunar(y, m, d);
+                    if (l) {
+                        const nl = frontendCalc.addPeriod({ year: l.year, month: l.month, day: l.day, isLeap: l.isLeap }, parseInt(item.intervalDays), item.cycleUnit || 'day');
+                        const ns = frontendCalc.l2s(nl);
+                        const nextDateUTC = new Date(Date.UTC(ns.year, ns.month - 1, ns.day));
+                        return nextDateUTC.toISOString().split('T')[0];
+                    }
+                } else {
+                    const start = new Date(startDateStr);
+                    const unit = item.cycleUnit || 'day';
+                    const interval = parseInt(item.intervalDays) || 1;
+                    if (unit === 'year') start.setFullYear(start.getFullYear() + interval);
+                    else if (unit === 'month') start.setMonth(start.getMonth() + interval);
+                    else start.setDate(start.getDate() + interval);
+                    const y = start.getFullYear();
+                    const m = (start.getMonth() + 1).toString().padStart(2, '0');
+                    const d = start.getDate().toString().padStart(2, '0');
+                    return y + '-' + m + '-' + d;
+                }
+            } catch (e) {
+                console.error('Cycle calculation error:', e);
+            }
+            return null;
+        };
+
+        const app = createApp({
             setup() {
-                const isLoggedIn = ref(!!localStorage.getItem('jwt_token')), password = ref(''), loading = ref(false), list = ref([]), settings = ref({});
+                const isLoggedIn = ref(!!localStorage.getItem('jwt_token')), password = ref(''), loading = ref(false), list = ref([]), settings = ref({ upcomingBillsDays: 7 });
                 const dataVersion = ref(0); // 新增版本号状态
                 const dialogVisible = ref(false), settingsVisible = ref(false), historyVisible = ref(false), historyLoading = ref(false), historyLogs = ref([]);
                 const checking = ref(false), logs = ref([]), displayLogs = ref([]), isEdit = ref(false), lang = ref('zh'), currentTag = ref(''), searchKeyword = ref('');
-                const locale = ref(ZhCn), tableKey = ref(0), termRef = ref(null);
-                const form = ref({ id:'', name:'', createDate:'', lastRenewDate:'', intervalDays:30, cycleUnit:'day', type:'cycle', message:'', enabled:true, tags:[], useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:true, autoRenewDays:3 });
+                const currentView = ref('project');
+                const hoverIndex = ref(-1);
+                const spendingMode = ref('op');
+                const selectedYear = ref('recent'); // 'recent' = last 12 months, or year number like 2024
+                const selectedMonth = ref(null); // selected month key like '2026-01' for detail view
+                const locale = ref(ZhCn), tableKey = ref(0), termRef = ref(null), submitting = ref(false);
+                const form = ref({ id:'', name:'', createDate:'', lastRenewDate:'', intervalDays:30, cycleUnit:'day', type:'cycle', message:'', enabled:true, tags:[], useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:true, autoRenewDays:3, fixedPrice:0, currency:'CNY', renewHistory:[] });
                 const settingsForm = ref({ 
                     notifyUrl:'', 
                     enableNotify:true, 
                     autoDisableDays:30, 
+                    upcomingBillsDays: 7,
+                    notifyTitle: '',
                     timezone:'UTC',
+                    defaultCurrency:'CNY',
                     enabledChannels: [],
                     notifyConfig: { telegram: {}, bark: {}, pushplus: {}, notifyx: {}, resend: {}, webhook: {}, webhook2: {}, webhook3: {}, gotify: {}, ntfy: {} },
                     calendarToken: ''
@@ -2409,7 +3078,10 @@ const HTML = `<!DOCTYPE html>
                     { text: t('filter.expired'), value: 'expired' },
                     { text: t('filter.w7'), value: 'w7' },
                     { text: t('filter.w30'), value: 'w30' },
-                    { text: t('filter.future'), value: 'future' }
+                    { text: t('filter.thisMonth'), value: 'thisMonth' },
+                    { text: t('filter.nextMonth'), value: 'nextMonth' },
+                    { text: t('filter.halfYear'), value: 'halfYear' },
+                    { text: t('filter.oneYear'), value: 'oneYear' }
                 ]);
                 const typeFilters = computed(() => [
                     { text: t('typeCycle'), value: 'cycle' },
@@ -2427,9 +3099,343 @@ const HTML = `<!DOCTYPE html>
                     { text: t('filter.earlier'), value: 'earlier' }
                 ]);
                 const t = (k) => { let v=messages[lang.value]; k.split('.').forEach(p=>v=v?v[p]:k); return v||k; };
-                const expiringCount = computed(() => list.value.filter(i => i.enabled && i.daysLeft>0 && i.daysLeft<=((typeof i.notifyDays==='number')?i.notifyDays:3)).length);
-                const expiredCount = computed(() => list.value.filter(i => i.enabled && i.daysLeft<=0).length);
+                
+                const calculateTotal = (items) => {
+                    let total = 0;
+                    const defaultCur = settings.value.defaultCurrency || 'CNY';
+                    const rates = exchangeRates.value || {};
+                    items.forEach(item => {
+                        const price = parseFloat(item.fixedPrice) || 0;
+                        const cur = item.currency || defaultCur;
+                        if (cur === defaultCur) {
+                            total += price;
+                        } else if (rates[cur]) {
+                            total += price / rates[cur];
+                        } else {
+                            total += price; 
+                        }
+                    });
+                    return total.toFixed(2);
+                };
+
+                const expiringItems = computed(() => list.value.filter(i => i.enabled && i.daysLeft>0 && i.daysLeft<=((typeof i.notifyDays==='number')?i.notifyDays:3)));
+                const expiredItems = computed(() => list.value.filter(i => i.enabled && i.daysLeft<=0));
+                
+                const expiringCount = computed(() => expiringItems.value.length);
+                const expiredCount = computed(() => expiredItems.value.length);
+                
+                const expiringTotal = computed(() => calculateTotal(expiringItems.value));
+                const expiredTotal = computed(() => calculateTotal(expiredItems.value));
+                const totalAmount = computed(() => calculateTotal(list.value));
+                
+// Spending Stats (Refactored: Fix Year Range & Project Details)
+                const spendingStats = computed(() => {
+                    const defaultCur = settings.value.defaultCurrency || 'CNY';
+                    const now = new Date();
+                    const currentMonthKey = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
+                    const rates = exchangeRates.value || {};
+                    const convert = (p, c) => (c !== defaultCur && rates[c]) ? p / rates[c] : p;
+                    
+                    // Define Ranges based on selectedYear
+                    const monthKeys = [];
+                    const sel = selectedYear.value;
+                    if (sel === 'recent') {
+                        for(let i=11; i>=0; i--) {
+                            const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+                            monthKeys.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+                        }
+                    } else {
+                        const y = parseInt(sel);
+                        for(let m=1; m<=12; m++) {
+                            monthKeys.push(y + '-' + String(m).padStart(2, '0'));
+                        }
+                    }
+                    
+                    // 【修改 1】年度范围：仅保留今年、去年、前年 (去除明年)
+                    const yearKeys = [now.getFullYear()-2, now.getFullYear()-1, now.getFullYear()];
+
+                    // 【修改 2】增加 details 字段用于存储明细
+                    const data = {
+                        bill: { months: {}, years: {}, monthCounts: {}, details: {} },
+                        op:   { months: {}, years: {}, monthCounts: {}, details: {} }
+                    };
+                    
+                    // 辅助函数：添加明细
+                    const addDetail = (mode, monthKey, item, price, dateStr, periodStr, isProjected = false) => {
+                        if (!data[mode].details[monthKey]) data[mode].details[monthKey] = [];
+                        data[mode].details[monthKey].push({
+                            name: item.name,
+                            amount: price.toFixed(2),
+                            currency: defaultCur, // 已转换为默认币种
+                            date: dateStr,
+                            period: periodStr,
+                            isProjected: isProjected,
+                            tags: item.tags || []
+                        });
+                    };
+
+                    list.value.forEach(item => {
+                         const history = item.renewHistory || [];
+                         const cur = item.currency || defaultCur;
+                         const processedBillDates = new Set();
+                         
+                         // 1. History Records (Past Data)
+                         history.forEach(r => {
+                             let price = parseFloat(r.price || r.actualPrice || item.fixedPrice) || 0;
+                             price = convert(price, r.currency || cur);
+                             
+                             // Bill Amount (Start Date based)
+                             if(r.startDate) {
+                                 processedBillDates.add(r.startDate);
+                                 const p = r.startDate.split('-');
+                                 const y = parseInt(p[0]), m = parseInt(p[1]);
+                                 if(y && m) {
+                                     const mk = y + '-' + String(m).padStart(2,'0');
+                                     data.bill.months[mk] = (data.bill.months[mk]||0) + price;
+                                     data.bill.monthCounts[mk] = (data.bill.monthCounts[mk]||0) + 1;
+                                     data.bill.years[y] = (data.bill.years[y]||0) + price;
+                                     // 记录明细
+                                     addDetail('bill', mk, item, price, r.startDate, \`\${ r.startDate } -> \${ r.endDate || '?' } \`);
+                                 }
+                             }
+                             // Operation Spending (Op Date based)
+                             if(r.renewDate) {
+                                 const p = r.renewDate.split('-'); 
+                                 const y = parseInt(p[0]), m = parseInt(p[1]);
+                                 if(y && m) {
+                                     const mk = y + '-' + String(m).padStart(2,'0');
+                                     data.op.months[mk] = (data.op.months[mk]||0) + price;
+                                     data.op.monthCounts[mk] = (data.op.monthCounts[mk]||0) + 1;
+                                     data.op.years[y] = (data.op.years[y]||0) + price;
+                                     // 记录明细
+                                     addDetail('op', mk, item, price, r.renewDate.split(' ')[0], \`\${ r.startDate || '?' } -> \${ r.endDate || '?' } \`);
+                                 }
+                             }
+                         });
+
+                         // 2. Legacy/Current Data (No history yet)
+                         if(item.startDate || item.lastRenewDate) {
+                             const dateStr = (item.startDate || item.lastRenewDate).substring(0, 10);
+                             if (!processedBillDates.has(dateStr)) {
+                                 processedBillDates.add(dateStr);
+                                 let price = parseFloat(item.fixedPrice) || 0;
+                                 price = convert(price, cur);
+                                 const p = dateStr.split('-');
+                                 const y = parseInt(p[0]), m = parseInt(p[1]);
+                                 if(y && m) {
+                                     const mk = y + '-' + String(m).padStart(2,'0');
+                                     data.bill.months[mk] = (data.bill.months[mk]||0) + price;
+                                     data.bill.monthCounts[mk] = (data.bill.monthCounts[mk]||0) + 1;
+                                     data.bill.years[y] = (data.bill.years[y]||0) + price;
+                                     // 估算结束日期用于显示
+                                     let legacyEnd = '?'; 
+                                     // 这里简单处理，因为没有 rigorous calculation context
+                                     addDetail('bill', mk, item, price, dateStr, \`\${ dateStr } -> \${ legacyEnd } \`);
+                                 }
+                             }
+                         }
+
+                         // 3. Future Projection (Auto-Renew)
+                         if(item.autoRenew && item.nextDueDate && item.enabled !== false) {
+                             let price = parseFloat(item.fixedPrice) || 0;
+                             price = convert(price, cur);
+                             
+                             let nextStart = parseYMD(item.nextDueDate);
+                             const maxYear = Math.max(...yearKeys); // 只预测到统计图显示的年份
+                             const unit = item.cycleUnit || 'day';
+                             const val = parseInt(item.intervalDays) || 1;
+                             
+                             for(let i=0; i<12; i++) { 
+                                 const y = nextStart.getFullYear();
+                                 if(y > maxYear) break;
+
+                                 const mm = nextStart.getMonth() + 1;
+                                 const dd = nextStart.getDate();
+                                 const dateStr = y + '-' + String(mm).padStart(2,'0') + '-' + String(dd).padStart(2,'0');
+
+                                 // 计算该周期的结束日 (用于 UI 显示)
+                                 const currentStartObj = new Date(nextStart);
+                                 let currentEndObj = new Date(nextStart);
+                                 if(unit === 'year') currentEndObj.setFullYear(currentEndObj.getFullYear() + val);
+                                 else if(unit === 'month') currentEndObj.setMonth(currentEndObj.getMonth() + val);
+                                 else currentEndObj.setDate(currentEndObj.getDate() + val);
+                                 const endY = currentEndObj.getFullYear();
+                                 const endM = currentEndObj.getMonth() + 1;
+                                 const endD = currentEndObj.getDate();
+                                 const endDateStr = endY + '-' + String(endM).padStart(2,'0') + '-' + String(endD).padStart(2,'0');
+
+                                 if(!processedBillDates.has(dateStr)) {
+                                     const mk = y + '-' + String(mm).padStart(2,'0');
+                                     data.bill.months[mk] = (data.bill.months[mk]||0) + price;
+                                     data.bill.monthCounts[mk] = (data.bill.monthCounts[mk]||0) + 1;
+                                     data.bill.years[y] = (data.bill.years[y]||0) + price;
+                                     processedBillDates.add(dateStr);
+                                     
+                                     // 【修改 3】将预测数据加入明细
+                                     // 注意：预测只有在“账单金额”模式下才有效，操作支出模式下无法预测未来的操作时间
+                                     addDetail('bill', mk, item, price, dateStr, \`\${ dateStr } -> \${ endDateStr } \`, true);
+                                 }
+
+                                 // 推进到下个周期
+                                 nextStart = currentEndObj;
+                             }
+                         }
+                    });
+
+                    const processStats = (source) => {
+                         const trends = monthKeys.map((key, idx) => {
+                             const val = source.months[key] || 0;
+                             const [y, m] = key.split('-').map(Number);
+                             const prevD = new Date(y, m-2, 1);
+                             const prevKey = prevD.getFullYear() + '-' + String(prevD.getMonth()+1).padStart(2,'0');
+                             const prevVal = source.months[prevKey] || 0;
+                             let growth = 0;
+                             if(prevVal > 0) growth = ((val - prevVal)/prevVal)*100;
+                             else if(val > 0) growth = 100;
+                             return { month: key, total: val.toFixed(2), val: val, count: source.monthCounts[key] || 0, growth: growth.toFixed(1), isCurrent: key === currentMonthKey, prevVal: prevVal };
+                         });
+                         const maxM = Math.max(...trends.map(t=>t.val), 1);
+                         trends.forEach(t => t.pct = Math.round((t.val/maxM)*100));
+                         const sumVal = trends.reduce((acc, t) => acc + t.val, 0);
+                         const avgVal = sumVal / trends.length;
+                         const avgPct = Math.round((avgVal / maxM) * 100);
+                         
+                         // Annual Data
+                         const annual = yearKeys.map(y => ({ year: y, total: (source.years[y]||0).toFixed(2), val: source.years[y]||0 }));
+                         return { trends, annual, avgVal, avgPct, recentTotal: sumVal, details: source.details };
+                    };
+
+                    const recentMonthKeys = [];
+                    for(let i=11; i>=0; i--) {
+                        const d = new Date(now.getFullYear(), now.getMonth()-i, 1);
+                        recentMonthKeys.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+                    }
+                    const calcRecentTotal = (source) => recentMonthKeys.reduce((sum, mk) => sum + (source.months[mk] || 0), 0);
+
+                    const billStats = processStats(data.bill);
+                    const opStats = processStats(data.op);
+                    
+                    billStats.recentTotal = calcRecentTotal(data.bill);
+                    opStats.recentTotal = calcRecentTotal(data.op);
+                    
+                    const billMaxWithRecent = Math.max(...billStats.annual.map(a => a.val), billStats.recentTotal, 1);
+                    const opMaxWithRecent = Math.max(...opStats.annual.map(a => a.val), opStats.recentTotal, 1);
+                    billStats.annual.forEach(a => a.pct = Math.round((a.val / billMaxWithRecent) * 100));
+                    opStats.annual.forEach(a => a.pct = Math.round((a.val / opMaxWithRecent) * 100));
+                    billStats.recentPct = Math.round((billStats.recentTotal / billMaxWithRecent) * 100);
+                    opStats.recentPct = Math.round((opStats.recentTotal / opMaxWithRecent) * 100);
+
+                    const getSelectedInfo = (stats) => {
+                        if (sel === 'recent') return { label: '12M', total: stats.recentTotal.toFixed(2) };
+                        const y = parseInt(sel);
+                        const found = stats.annual.find(a => a.year === y);
+                        return { label: String(y), total: found ? found.total : '0' };
+                    };
+                    billStats.selectedInfo = getSelectedInfo(billStats);
+                    opStats.selectedInfo = getSelectedInfo(opStats);
+
+                    return { bill: billStats, op: opStats, hasData: billStats.recentTotal > 0 || opStats.recentTotal > 0 || billStats.annual.some(a => a.val > 0) || opStats.annual.some(a => a.val > 0) };
+                });
+
+                // Month Details: 直接从 spendingStats 中获取预处理好的明细
+                const monthDetails = computed(() => {
+                    if (!selectedMonth.value || !spendingStats.value.hasData) return [];
+                    const mode = spendingMode.value;
+                    const details = spendingStats.value[mode].details[selectedMonth.value] || [];
+                    // 按日期倒序排列
+                    return details.sort((a, b) => b.date.localeCompare(a.date));
+                });
+
                 const disabledCount = computed(() => list.value.filter(i => !i.enabled).length);
+                const upcoming7DaysBills = computed(() => {
+                    const daysLimit = settings.value.upcomingBillsDays || 7;
+                    const results = [];
+                    const todayDate = parseYMD(getLocalToday()); // Use local today for diff calc
+
+                    list.value.forEach(i => {
+                        if (!i.enabled) return;
+
+                        // 1. Current Next Due (Existing Logic)
+                        if (i.daysLeft >= 0 && i.daysLeft <= daysLimit) {
+                            results.push({
+                                name: i.name,
+                                days: i.daysLeft,
+                                amount: i.fixedPrice,
+                                currency: i.currency || settings.value.defaultCurrency,
+                                isProjected: false
+                            });
+                        }
+
+                        // 2. Future Projections (Auto-Renew)
+                        if (i.autoRenew && i.intervalDays && i.nextDueDate) {
+                            let currentBaseDate;
+                            try { currentBaseDate = parseYMD(i.nextDueDate); } catch(e) { return; }
+                            
+                            const unit = i.cycleUnit || 'day';
+                            const val = parseInt(i.intervalDays) || 1;
+
+                            // Prevent infinite loop if interval is 0 (safety)
+                            if (val <= 0) return;
+
+                            while (true) {
+                                // Advance date
+                                let nextDate;
+                                if (i.useLunar && typeof LUNAR !== 'undefined' && typeof frontendCalc !== 'undefined') {
+                                    const y = currentBaseDate.getFullYear(), m = currentBaseDate.getMonth() + 1, d = currentBaseDate.getDate();
+                                    const l = LUNAR.solar2lunar(y, m, d);
+                                    if (!l) break;
+                                    const nextL = frontendCalc.addPeriod({ year: l.year, month: l.month, day: l.day, isLeap: l.isLeap }, val, unit);
+                                    const nextS = frontendCalc.l2s(nextL);
+                                    nextDate = new Date(nextS.year, nextS.month - 1, nextS.day);
+                                } else {
+                                    nextDate = new Date(currentBaseDate);
+                                    if (unit === 'year') nextDate.setFullYear(nextDate.getFullYear() + val);
+                                    else if (unit === 'month') nextDate.setMonth(nextDate.getMonth() + val);
+                                    else nextDate.setDate(nextDate.getDate() + val);
+                                }
+
+                                // Update base for next iteration
+                                currentBaseDate = nextDate;
+
+                                // Calculate diff
+                                const diffTime = nextDate - todayDate;
+                                const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+                                if (diffDays > daysLimit) break;
+
+                                // Only add valid future dates
+                                if (diffDays >= 0) {
+                                    results.push({
+                                        name: i.name,
+                                        days: diffDays,
+                                        amount: i.fixedPrice,
+                                        currency: i.currency || settings.value.defaultCurrency,
+                                        isProjected: true
+                                    });
+                                }
+                            }
+                        }
+                    });
+
+                    return results.sort((a, b) => a.days - b.days);
+                });
+                const upcoming7DaysTotal = computed(() => {
+                    const rates = exchangeRates.value || {};
+                    const defaultCur = settings.value.defaultCurrency || 'CNY';
+                    let total = 0;
+                    upcoming7DaysBills.value.forEach(bill => {
+                        const price = parseFloat(bill.amount) || 0;
+                        const cur = bill.currency || defaultCur;
+                         if (cur === defaultCur) {
+                            total += price;
+                        } else if (rates[cur]) {
+                            total += price / rates[cur];
+                        } else {
+                            total += price; // Fallback
+                        }
+                    });
+                    return '≈ ' + total.toFixed(2) + ' ' + defaultCur;
+                });
                 const allTags = computed(() => { const s=new Set(); list.value.forEach(i=>(i.tags||[]).forEach(t=>s.add(t))); return Array.from(s).sort(); });
                 const filteredList = computed(() => {
                     let r = list.value;
@@ -2439,17 +3445,36 @@ const HTML = `<!DOCTYPE html>
 
                     if (filterState.value.daysLeft && filterState.value.daysLeft.length > 0) {
                         const fv = filterState.value.daysLeft;
-                        r = r.filter(row => {
-                            const d = row.daysLeft;
-                            return fv.some(v => {
-                                if (v === 'expired') return d <= 0;
-                                if (v === 'w7') return d > 0 && d <= 7;
-                                if (v === 'w30') return d > 7 && d <= 30;
-                                if (v === 'future') return d > 30;
-                                return false;
+                        const w7Days = settings.value.upcomingBillsDays || 7;
+                            r = r.filter(row => {
+                                const d = row.daysLeft;
+                                const nd = row.nextDueDate || '';
+                                const today = new Date();
+                                const curY = today.getFullYear();
+                                const curM = today.getMonth() + 1;
+                                
+                                return fv.some(v => {
+                                    if (v === 'expired') return d <= 0;
+                                    if (v === 'w7') return d > 0 && d <= 7;
+                                    if (v === 'w30') return d > 0 && d <= 30;
+                                    if (v === 'thisMonth') {
+                                        if (!nd) return false;
+                                        const [y, m] = nd.split('-').map(Number);
+                                        return y === curY && m === curM;
+                                    }
+                                    if (v === 'nextMonth') {
+                                        if (!nd) return false;
+                                        let ty = curY, tm = curM + 1;
+                                        if (tm > 12) { tm = 1; ty++; }
+                                        const [y, m] = nd.split('-').map(Number);
+                                        return y === ty && m === tm;
+                                    }
+                                    if (v === 'halfYear') return d > 0 && d <= 183;
+                                    if (v === 'oneYear') return d > 0 && d <= 366;
+                                    return false;
+                                });
                             });
-                        });
-                    }
+                        }
 
                     if (filterState.value.type && filterState.value.type.length > 0) {
                         const fv = filterState.value.type;
@@ -2500,7 +3525,22 @@ const HTML = `<!DOCTYPE html>
                 });
 
                 onMounted(() => {
-
+                    // Check if migration is needed (Once per day)
+                    const checkMigrationNeeded = async () => {
+                        const lastCheck = localStorage.getItem('lastMigrationCheck');
+                        const today = new Date().toDateString();
+                        
+                        if (lastCheck === today) return; // Already checked today
+                        
+                        // Wait for list to load (simple poll since list is loaded async in login or initial load)
+                        // Actually list is empty until login. Assuming user is logged in or will log in.
+                        // We can hook into the login success or list load.
+                        // But onMounted runs once. 
+                        // Let's rely on list watcher or check after a delay if logged in.
+                        // However, simpler approach: Check when list is populated.
+                    };
+                    
+                    // Theme init
                     const savedTheme = localStorage.getItem('theme');
 
                     const sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -2516,6 +3556,41 @@ const HTML = `<!DOCTYPE html>
                     const l = localStorage.getItem('lang'); if(l) setLang(l);
                     const tk = localStorage.getItem('jwt_token'); if(tk) fetchList(tk);
                     
+                    // After initial fetchList (if token exists), check for migration
+                    // Using a watcher on list.value to ensure it's populated
+                    const unwatchList = watch(list, (newList) => {
+                        if (newList && newList.length > 0) {
+                            const info = newList.filter(item => (!item.renewHistory || item.renewHistory.length === 0) && item.lastRenewDate && item.intervalDays);
+                            if (info.length > 0) {
+                                const lastCheck = localStorage.getItem('lastMigrationCheck');
+                                const today = new Date().toDateString();
+                                if (lastCheck !== today) {
+                                    localStorage.setItem('lastMigrationCheck', today);
+                                    ElMessageBox.confirm(
+                                        lang.value === 'zh' 
+                                            ? '检测到 ' + info.length + ' 个项目缺少历史账单。建议先备份数据再执行迁移，是否继续？(今日仅提示一次)' 
+                                            : 'Found ' + info.length + ' items without history. Recommend backup first. Continue? (Ask once today)',
+                                        lang.value === 'zh' ? '数据优化建议' : 'Optimization Suggestion',
+                                        { confirmButtonText: lang.value === 'zh' ? '备份并迁移' : 'Backup & Migrate', cancelButtonText: t('cancel'), type: 'info' }
+                                    ).then(async () => {
+                                        await exportData();
+                                        setTimeout(() => {
+                                            ElMessageBox.confirm(
+                                                lang.value === 'zh' ? '备份文件是否已保存？确认后将开始迁移。' : 'Is the backup saved? Migration will start upon confirmation.',
+                                                lang.value === 'zh' ? '最后确认' : 'Final Confirmation',
+                                                { confirmButtonText: lang.value === 'zh' ? '确认迁移' : 'Start Migration', cancelButtonText: t('cancel'), type: 'warning' }
+                                            ).then(() => {
+                                                migrateOldData(true);
+                                            }).catch(()=>{});
+                                        }, 1000);
+                                    }).catch(()=>{});
+                            }
+                        }
+                            fetchExchangeRates(settings.value.defaultCurrency || 'CNY'); // Ensure rates are available for summary
+                            unwatchList(); // Stop watching after the first check
+                        }
+                    });
+
                     window.addEventListener('resize', updateWidth);
                 });
 
@@ -2552,7 +3627,8 @@ const HTML = `<!DOCTYPE html>
                         }
 
                         list.value = d.data.items;
-                        settings.value = d.data.settings;
+                        settings.value = d.data.settings || {};
+                        if (!settings.value.upcomingBillsDays) settings.value.upcomingBillsDays = 7;
                         dataVersion.value = d.data.version || 0;
 
                         if (settings.value.language) setLang(settings.value.language);
@@ -2611,6 +3687,49 @@ const HTML = `<!DOCTYPE html>
                     if(list.value.some(i=>i.name.toLowerCase()===form.value.name.toLowerCase() && i.id!==form.value.id)) return ElMessage.error(t('msg.nameExist'));
                     if(form.value.lastRenewDate < form.value.createDate) return ElMessage.error(t('msg.dateError'));
                     if(form.value.lastRenewDate > getLocalToday()) return ElMessage.error(t('msg.futureError'));
+                    
+// 新建时自动创建初始账单记录
+                    if (!isEdit.value && form.value.lastRenewDate && form.value.intervalDays) {
+                        const startDate = form.value.lastRenewDate;
+                        let endDate = startDate;
+                        
+                        // 计算 endDate = startDate + intervalDays (往后推算)
+                        if (form.value.useLunar && typeof LUNAR !== 'undefined' && typeof frontendCalc !== 'undefined') {
+                            // 【修复】农历逻辑：先转为农历对象 -> 计算 -> 转回公历
+                            const d = parseYMD(startDate); // 字符串转 Date
+                            const l = LUNAR.solar2lunar(d.getFullYear(), d.getMonth() + 1, d.getDate());
+                            
+                            if (l) {
+                                const nextL = frontendCalc.addPeriod(l, Number(form.value.intervalDays), form.value.cycleUnit || 'day');
+                                const nextS = frontendCalc.l2s(nextL);
+                                endDate = \`\${nextS.year}-\${nextS.month.toString().padStart(2, '0')}-\${nextS.day.toString().padStart(2, '0')}\`;
+                            }
+                        } else {
+                            // 公历：普通日期计算
+                            const start = new Date(startDate);
+                            const unit = form.value.cycleUnit || 'day';
+                            const interval = Number(form.value.intervalDays) || 1;
+                            if (unit === 'year') start.setFullYear(start.getFullYear() + interval);
+                            else if (unit === 'month') start.setMonth(start.getMonth() + interval);
+                            else start.setDate(start.getDate() + interval);
+                            const y = start.getFullYear();
+                            const m = (start.getMonth() + 1).toString().padStart(2, '0');
+                            const d = start.getDate().toString().padStart(2, '0');
+                            endDate = y + '-' + m + '-' + d;
+                        }
+                        
+                        // 使用 startDate(即 lastRenewDate) 的 0点作为操作时间
+                        const renewDate = startDate + ' 00:00:00';
+                        
+                        form.value.renewHistory = [{
+                            renewDate: renewDate,
+                            startDate: startDate,
+                            endDate: endDate,
+                            price: form.value.fixedPrice || 0,
+                            currency: form.value.currency || settings.value.defaultCurrency || 'CNY',
+                            note: lang.value === 'zh' ? '自动初始账单' : 'Auto Initial'
+                        }];
+                    }
                     
                     let newList=[...list.value];
                     if(isEdit.value) { const i=newList.findIndex(x=>x.id===form.value.id); if(i!==-1) newList[i]=form.value; }
@@ -2688,19 +3807,25 @@ const HTML = `<!DOCTYPE html>
                     } catch (e) { return isoStr; }
                 };                
 
-                const openAdd = () => { isEdit.value=false; const d=getLocalToday(); form.value={id:Date.now().toString(),name:'',createDate:d,lastRenewDate:d,intervalDays:30,cycleUnit:'day',type:'cycle',enabled:true,tags:[],useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:true, autoRenewDays:3}; dialogVisible.value=true; };
+                const openAdd = () => { isEdit.value=false; const d=getLocalToday(); form.value={id:Date.now().toString(),name:'',createDate:d,lastRenewDate:d,intervalDays:30,cycleUnit:'day',type:'cycle',enabled:true,tags:[],useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:true, autoRenewDays:3, fixedPrice:0, currency:settings.value.defaultCurrency||'CNY', renewHistory:[]}; dialogVisible.value=true; };
                 const editItem = (row) => { isEdit.value=true; form.value={...row,cycleUnit:row.cycleUnit||'day',tags:[...(row.tags||[])],useLunar:!!row.useLunar, notifyDays:(row.notifyDays!==undefined?row.notifyDays:3), notifyTime: (row.notifyTime || '08:00'), autoRenew:row.autoRenew!==false, autoRenewDays:(row.autoRenewDays!==undefined?row.autoRenewDays:3)}; dialogVisible.value=true; };
                 const openSettings = () => { 
                     settingsForm.value = JSON.parse(JSON.stringify(settings.value)); 
+                    if (!settingsForm.value.upcomingBillsDays) settingsForm.value.upcomingBillsDays = 7;
                     const chans = settingsForm.value.enabledChannels || [];
                     Object.keys(channelMap).forEach(k => channelMap[k] = chans.includes(k));
                     settingsVisible.value=true; 
                 };
                 const saveSettings = async () => { 
                     settingsForm.value.enabledChannels = Object.keys(channelMap).filter(k => channelMap[k]);
+                    const oldCurrency = settings.value.defaultCurrency;
                     settings.value={...settingsForm.value}; 
                     await saveData(null,settings.value); 
                     settingsVisible.value=false; 
+                    
+                    if (settings.value.defaultCurrency !== oldCurrency) {
+                        fetchExchangeRates(settings.value.defaultCurrency);
+                    }
                 };
                 const toggleChannel = (ch) => {};
 
@@ -2743,6 +3868,75 @@ const HTML = `<!DOCTYPE html>
                     } catch {}
                 };
 
+                // 迁移旧数据：为没有续费记录的项目生成初始账单
+                const migrateOldData = async (skipConfirm = false) => {
+                    try {
+                        if (!skipConfirm) {
+                            await ElMessageBox.confirm(
+                                lang.value === 'zh' 
+                                    ? '此操作将为所有没有续费记录的项目生成初始账单，是否继续？' 
+                                    : 'This will generate initial bills for all items without history. Continue?',
+                                lang.value === 'zh' ? '数据迁移' : 'Data Migration',
+                                { type: 'info', confirmButtonText: t('yes'), cancelButtonText: t('no') }
+                            );
+                        }
+                        
+                        let count = 0;
+                        const now = new Date();
+                        const renewDate = now.getFullYear() + '-' + (now.getMonth() + 1).toString().padStart(2, '0') + '-' + now.getDate().toString().padStart(2, '0') + ' ' + now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0') + ':' + now.getSeconds().toString().padStart(2, '0');
+                        
+                        list.value.forEach(item => {
+                            if ((!item.renewHistory || item.renewHistory.length === 0) && item.lastRenewDate && item.intervalDays) {
+                                const startDate = item.lastRenewDate;
+                                let endDate = startDate;
+                                
+                                // 计算 endDate = startDate + interval（支持农历和公历）
+                                if (item.useLunar && typeof LUNAR !== 'undefined' && typeof frontendCalc !== 'undefined') {
+                                    // 【修复】农历逻辑：先转为农历对象 -> 计算 -> 转回公历
+                                    const d = parseYMD(startDate);
+                                    const l = LUNAR.solar2lunar(d.getFullYear(), d.getMonth() + 1, d.getDate());
+                                    
+                                    if (l) {
+                                        const nextL = frontendCalc.addPeriod(l, Number(item.intervalDays), item.cycleUnit || 'day');
+                                        const nextS = frontendCalc.l2s(nextL);
+                                        endDate = \`\${nextS.year}-\${nextS.month.toString().padStart(2, '0')}-\${nextS.day.toString().padStart(2, '0')}\`;
+                                    }
+                                } else {
+                                    // 公历：普通日期计算
+                                    const start = new Date(startDate);
+                                    const unit = item.cycleUnit || 'day';
+                                    const interval = Number(item.intervalDays) || 1;
+                                    if (unit === 'year') start.setFullYear(start.getFullYear() + interval);
+                                    else if (unit === 'month') start.setMonth(start.getMonth() + interval);
+                                    else start.setDate(start.getDate() + interval);
+                                    const y = start.getFullYear();
+                                    const m = (start.getMonth() + 1).toString().padStart(2, '0');
+                                    const d = start.getDate().toString().padStart(2, '0');
+                                    endDate = y + '-' + m + '-' + d;
+                                }
+                                
+                                item.renewHistory = [{
+                                    renewDate: startDate + ' 00:00:00',
+                                    startDate: startDate,
+                                    endDate: endDate,
+                                    price: item.fixedPrice || 0,
+                                    currency: item.currency || settings.value.defaultCurrency || 'CNY',
+                                    note: lang.value === 'zh' ? '自动初始账单' : 'Auto Initial'
+                                }];
+                                count++;
+                            }
+                        });
+                        
+                        if (count > 0) {
+                            await saveData(null, null, false);
+                            tableKey.value++;
+                            ElMessage.success(lang.value === 'zh' ? '已为 ' + count + ' 个项目生成初始账单' : 'Generated initial bills for ' + count + ' items');
+                        } else {
+                            ElMessage.info(lang.value === 'zh' ? '没有需要迁移的项目' : 'No items need migration');
+                        }
+                    } catch {}
+                };
+
                 const clearLogs = async () => { await fetch('/api/logs/clear',{method:'POST',headers:getAuth()}); historyLogs.value=[]; ElMessage.success(t('msg.cleared')); };
                 const openHistoryLogs = async () => { historyVisible.value=true; historyLoading.value=true; try { historyLogs.value=(await(await fetch('/api/logs',{headers:getAuth()})).json()).data; } finally { historyLoading.value=false; } };
 
@@ -2753,6 +3947,8 @@ const HTML = `<!DOCTYPE html>
                 const tableRowClassName = ({row}) => row.enabled===false?'disabled-row':'';
 
                 const getLunarStr = (s) => { const d=parseYMD(s); const l=LUNAR.solar2lunar(d.getFullYear(),d.getMonth()+1,d.getDate()); return l ? ('农历: ' + l.fullStr) : ''; };
+
+
 
                 const getLunarTooltip = (c) => { 
                     if(!c || !c.date) return ''; 
@@ -2805,6 +4001,454 @@ const HTML = `<!DOCTYPE html>
                     { label: 'Australia/Sydney (澳大利亚悉尼)', value: 'Australia/Sydney' },
                     { label: 'Pacific/Auckland (新西兰奥克兰)', value: 'Pacific/Auckland' }
                 ];
+                const currencyList = ['CNY', 'USD', 'EUR', 'GBP', 'HKD', 'JPY', 'SGD', 'MYR', 'KRW'];
+
+                // --- Bill Management Logic ---
+                const renewDialogVisible = ref(false);
+                const renewMode = ref('renew'); // 'renew' | 'addHistory'
+                const renewForm = ref({ id:'', name:'', renewDate:'', startDate:'', endDate:'', price:0, currency:'', note:'' });
+                const historyDialogVisible = ref(false);
+                const currentHistoryItem = ref({ renewHistory: [] });
+                const editingHistoryIndex = ref(-1);
+                const tempHistoryItem = ref({});
+                const historyPage = ref(1);
+                const historyPageSize = ref(5);
+// --- History Edit Logic ---
+
+
+
+                // 覆盖原有的 saveHistoryInfo (现在不需要手动点底部的保存了，改为行内保存，或者你可以保留它作为批量保存)
+                // 这里我们修改原有的 saveHistoryInfo 为关闭弹窗，因为现在是行内即时保存
+                const saveHistoryInfo = async () => {
+                   const realRow = list.value.find(i => i.id === currentHistoryItem.value.id);
+                   if (realRow) {
+                       realRow.renewHistory = currentHistoryItem.value.renewHistory;
+                       await saveData(null, null, true);
+                   }
+                   historyDialogVisible.value = false;
+                };
+                
+                // 监听弹窗关闭，重置编辑状态
+                watch(historyDialogVisible, (val) => {
+                    if (!val) cancelEditHistory();
+                });                // --- Currency Exchange Rates ---
+                const exchangeRates = ref({});
+                const ratesLoading = ref(false);
+
+                const fetchExchangeRates = async (baseCurrency) => {
+                    if (!baseCurrency) baseCurrency = 'CNY';
+                    const cacheKey = 'renew_ex_rates_' + baseCurrency;
+                    try {
+                        const cached = localStorage.getItem(cacheKey);
+                        if (cached) {
+                            const p = JSON.parse(cached);
+                            if (Date.now() - p.ts < 86400000) { // 24 hours cache
+                                exchangeRates.value = p.data;
+                                return;
+                            }
+                        }
+                    } catch(e){}
+
+                    ratesLoading.value = true;
+                    try {
+                        const res = await fetch('${EXCHANGE_RATE_API_URL}'+baseCurrency);
+                        if (res.ok) {
+                            const data = await res.json();
+                            const rates = { ...data.rates, [baseCurrency]: 1 };
+                            exchangeRates.value = rates;
+                            localStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), data: rates }));
+                        }
+                    } catch (e) { console.error('Failed to fetch exchange rates:', e); }
+                    ratesLoading.value = false;
+                };
+
+                // Compute current item info for Renew Dialog display
+                const currentRenewItem = computed(() => {
+                    if (!renewForm.value.id) return {};
+                    return list.value.find(i => i.id === renewForm.value.id) || {};
+                });
+
+                const openRenew = (row) => {
+                    // Helper: 格式化日期 (YYYY-MM-DD)
+                    const formatDate = (d) => \`\${d.getFullYear()}-\${(d.getMonth() + 1).toString().padStart(2, '0')}-\${d.getDate().toString().padStart(2, '0')}\`;
+                    // Helper: 格式化日期时间 (YYYY-MM-DD HH:mm:ss)
+                    const formatDateTime = (d) => \`\${formatDate(d)} \${d.getHours().toString().padStart(2, '0')}:\${d.getMinutes().toString().padStart(2, '0')}:\${d.getSeconds().toString().padStart(2, '0')}\`;
+
+                    const now = new Date();
+                    const opDateStr = formatDateTime(now); // 操作日期：始终为当前时间
+                    const todayStr = getLocalToday();      // 今天日期：YYYY-MM-DD
+
+                    // ============================================================
+                    // 1. 确定账单周期起始日 (Start Date Logic)
+                    // ============================================================
+                    let start = todayStr; // 默认值
+
+                    if (row.type === 'reset') {
+                        // 【Reset 模式】：起始日 = 操作日当天
+                        // 逻辑：不管之前什么时候到期，买了就是从今天开始算
+                        start = todayStr;
+                    } else {
+                        // 【Cycle 模式】：起始日 = 上次历史的结束日 (接续)
+                        // 逻辑：保持订阅的连续性
+                        const hist = row.renewHistory || [];
+                        if (hist.length > 0) {
+                            // 有历史记录：取最近一条历史的 EndDate
+                            const sorted = [...hist].sort((a, b) => (a.endDate < b.endDate ? 1 : -1));
+                            if (sorted[0].endDate) {
+                                start = sorted[0].endDate.substring(0, 10); // 截取 YYYY-MM-DD
+                            }
+                        } else if (row.lastRenewDate) {
+                            // 无历史记录：兜底使用 LastRenewDate
+                            start = row.lastRenewDate.substring(0, 10);
+                        }
+                    }
+
+                    // ============================================================
+                    // 2. 计算账单周期结束日 (End Date = Start + Interval)
+                    // ============================================================
+                    let end = start;
+                    if (row.intervalDays && start) {
+                        const sDate = parseYMD(start);
+                        
+                        // 农历计算逻辑
+                        if (row.useLunar) {
+                            const l = LUNAR.solar2lunar(sDate.getFullYear(), sDate.getMonth() + 1, sDate.getDate());
+                            if (l) {
+                                const nextL = frontendCalc.addPeriod({ year: l.year, month: l.month, day: l.day, isLeap: l.isLeap }, row.intervalDays, row.cycleUnit || 'day');
+                                const nextS = frontendCalc.l2s(nextL);
+                                end = \`\${nextS.year}-\${nextS.month.toString().padStart(2, '0')}-\${nextS.day.toString().padStart(2, '0')}\`;
+                            }
+                        } 
+                        // 公历计算逻辑
+                        else {
+                            const d = new Date(sDate);
+                            const u = row.cycleUnit || 'day';
+                            const n = row.intervalDays;
+                            if (u === 'year') d.setFullYear(d.getFullYear() + n);
+                            else if (u === 'month') d.setMonth(d.getMonth() + n);
+                            else d.setDate(d.getDate() + n);
+                            end = formatDate(d);
+                        }
+                    }
+
+                    // ============================================================
+                    // 3. 填充表单
+                    // ============================================================
+                    renewForm.value = {
+                        id: row.id,
+                        name: row.name,
+                        renewDate: opDateStr, // 操作时间
+                        startDate: start,     // 周期开始
+                        endDate: end,         // 周期结束
+                        price: row.fixedPrice || 0,
+                        currency: row.currency || settings.value.defaultCurrency || 'CNY',
+                        note: ''
+                    };
+                    renewMode.value = 'renew';
+                    renewDialogVisible.value = true;
+                };
+
+                const submitRenew = async () => {
+                    if (submitting.value) return;
+                    
+                    const rf = renewForm.value;
+                    
+                    // 构建历史记录对象
+                    const historyRecord = {
+                        renewDate: rf.renewDate,
+                        startDate: rf.startDate,
+                        endDate: rf.endDate,
+                        price: rf.price,
+                        currency: rf.currency,
+                        note: rf.note
+                    };
+                    
+                    submitting.value = true;
+                    // 【优化】立即关闭弹窗，提升响应速度并防止重复点击
+                    renewDialogVisible.value = false;
+                    
+                    try {
+                        // 1. 验证日期与周期是否匹配 (Common Validation) - 适用于 renew 和 addHistory
+                        let item = null;
+                        if (renewMode.value === 'addHistory') {
+                            item = currentHistoryItem.value;
+                        } else {
+                            item = list.value.find(i => i.id === rf.id);
+                        }
+
+                        if (item && item.intervalDays) {
+                            const expectedEnd = calculateCycleEndDate(rf.startDate, item);
+                            if (expectedEnd && expectedEnd !== rf.endDate) {
+                                try {
+                                    await ElMessageBox.confirm(
+                                        lang.value === 'zh' ? '当前结束日期与周期设置不符，是否确认保存？' : 'End date does not match the cycle settings. Save anyway?',
+                                        lang.value === 'zh' ? '周期不匹配' : 'Cycle Mismatch',
+                                        { confirmButtonText: t('yes'), cancelButtonText: t('cancel'), type: 'warning' }
+                                    );
+                                } catch (e) {
+                                    renewDialogVisible.value = true;
+                                    submitting.value = false;
+                                    return;
+                                }
+                            }
+                        }
+
+                        // ===== addHistory 模式：补录历史 =====
+                        if (renewMode.value === 'addHistory') {
+
+                            // 验证周期重叠
+                            const overlapResult = checkPeriodOverlap(rf.startDate, rf.endDate);
+                            if (overlapResult.overlap) {
+                                // 验证失败，重新打开弹窗（虽然闪烁但为了安全）
+                                renewDialogVisible.value = true;
+                                submitting.value = false;
+                                const existRecord = overlapResult.record;
+                                ElMessage.warning(lang.value === 'zh' 
+                                    ? '账单周期与已有记录重叠 (' + existRecord.startDate + ' ~ ' + existRecord.endDate + ')，请修改已有记录而非添加新记录'
+                                    : 'Period overlaps with existing record (' + existRecord.startDate + ' ~ ' + existRecord.endDate + '). Please edit the existing record instead.'
+                                );
+                                return;
+                            }
+                            
+                            // 添加记录后按 endDate 降序排序（最新的在前）
+                            const history = currentHistoryItem.value.renewHistory;
+                            history.push(historyRecord);
+                            history.sort((a, b) => new Date(b.endDate) - new Date(a.endDate));
+                            
+                            // 同步到主列表并保存
+                            const realRow = list.value.find(i => i.id === currentHistoryItem.value.id);
+                            if (realRow) {
+                                realRow.renewHistory = currentHistoryItem.value.renewHistory;
+                                await saveData(null, null, true);
+                            }
+                            
+                            historyPage.value = 1;
+                            return;
+                        }
+                        
+                        // ===== renew 模式：手动续期 =====
+                        const row = list.value.find(i => i.id === rf.id);
+                        if (!row) return;
+                        
+                        if (!Array.isArray(row.renewHistory)) row.renewHistory = [];
+                        row.renewHistory.unshift(historyRecord);
+
+                        // 更新主记录的 lastRenewDate
+                        const oldDate = row.lastRenewDate;
+                        row.lastRenewDate = rf.renewDate.substring(0, 10);
+                        
+                        // 乐观更新 UI
+                        tableKey.value++;
+                        ElMessage.success(t('msg.renewSuccess').replace('%s', oldDate).replace('%t', row.lastRenewDate));
+
+                        // 异步保存
+                        await saveData(null, null, false);
+                    } catch(e) {
+                         console.error(e);
+                         renewDialogVisible.value = true; // 发生错误重新打开以便重试
+                         ElMessage.error(e.message||'Error');
+                    } finally {
+                        submitting.value = false;
+                    }
+                };
+
+                const openHistory = (row) => {
+                    // Deep copy to avoid direct mutation until saved
+                    currentHistoryItem.value = JSON.parse(JSON.stringify(row));
+                    if (!Array.isArray(currentHistoryItem.value.renewHistory)) currentHistoryItem.value.renewHistory = [];
+                    historyPage.value = 1;
+                    historyDialogVisible.value = true;
+                    editingHistoryIndex.value = -1;
+                    // Fetch exchange rates for currency conversion
+                    fetchExchangeRates(settings.value.defaultCurrency || 'CNY');
+                };
+
+                const startEditHistory = (index, item) => {
+                    editingHistoryIndex.value = index;
+                    tempHistoryItem.value = JSON.parse(JSON.stringify(item));
+                };
+
+                const cancelEditHistory = () => {
+                    editingHistoryIndex.value = -1;
+                    tempHistoryItem.value = {};
+                };
+
+                const saveEditHistory = (index) => {
+                    // Update the array item
+                    const realIndex = (historyPage.value - 1) * historyPageSize.value + index;
+                    
+                    // Logic to update the actual item in renewHistory
+                    if (realIndex >= 0 && realIndex < currentHistoryItem.value.renewHistory.length) {
+                         const updated = { ...currentHistoryItem.value.renewHistory[realIndex], ...tempHistoryItem.value };
+                         // Ensure strings are saved (inputs bind to strings mostly)
+                         currentHistoryItem.value.renewHistory[realIndex] = updated;
+                    }
+                    
+                    editingHistoryIndex.value = -1;
+                    saveHistoryInfo(); // Auto save to persist
+                };
+
+                const pagedHistory = computed(() => {
+                    const hist = currentHistoryItem.value.renewHistory || [];
+                    const start = (historyPage.value - 1) * historyPageSize.value;
+                    return hist.slice(start, start + historyPageSize.value);
+                });
+
+                // --- Add History Dialog State ---
+                const addHistoryDialogVisible = ref(false);
+                const addHistoryForm = ref({ renewDate: '', startDate: '', endDate: '', price: 0, currency: 'CNY', note: '' });
+
+                // Check for period overlap
+                const checkPeriodOverlap = (startDate, endDate, excludeIndex = -1) => {
+                    if (!startDate || !endDate) return { overlap: false };
+                    const newStart = new Date(startDate);
+                    const newEnd = new Date(endDate);
+                    const history = currentHistoryItem.value.renewHistory || [];
+                    
+                    for (let i = 0; i < history.length; i++) {
+                        if (i === excludeIndex) continue;
+                        if (!history[i].startDate || !history[i].endDate) continue;
+                        const existStart = new Date(history[i].startDate);
+                        const existEnd = new Date(history[i].endDate);
+                        // Overlap: newStart < existEnd && newEnd > existStart (允许边界相等，即前一账单结束日=后一账单开始日)
+                        if (newStart < existEnd && newEnd > existStart) {
+                            return { overlap: true, index: i, record: history[i] };
+                        }
+                    }
+                    return { overlap: false };
+                };
+
+// Watch startDate to auto-calculate endDate in AddHistory mode
+                watch(() => renewForm.value.startDate, (newVal) => {
+                    if (!newVal) return;
+                    
+                    let item = null;
+                    if (renewMode.value === 'addHistory') {
+                        item = currentHistoryItem.value;
+                    } else if (renewMode.value === 'renew') {
+                        item = list.value.find(i => i.id === renewForm.value.id);
+                    }
+                    
+                    if (!item || !item.intervalDays) return;
+
+                    const newEnd = calculateCycleEndDate(newVal, item);
+                    if (newEnd) {
+                        renewForm.value.endDate = newEnd;
+                    }
+                });
+
+                // Open Add History via Renew Dialog (reuse)
+                const addHistoryRecord = () => {
+                    const now = new Date();
+                    const formatDateTime = (d) => d.getFullYear() + '-' + (d.getMonth() + 1).toString().padStart(2, '0') + '-' + d.getDate().toString().padStart(2, '0') + ' ' + d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0') + ':' + d.getSeconds().toString().padStart(2, '0');
+                    const d = getLocalToday();
+                    renewForm.value = {
+                        id: currentHistoryItem.value.id, // Use currentHistoryItem's id for addHistory mode 
+                        name: currentHistoryItem.value.name,
+                        renewDate: formatDateTime(now),
+                        startDate: d,
+                        endDate: d, // Will be updated by watcher
+                        price: currentHistoryItem.value.fixedPrice || 0,
+                        currency: currentHistoryItem.value.currency || settings.value.defaultCurrency || 'CNY',
+                        note: ''
+                    };
+                    renewMode.value = 'addHistory';
+                    renewDialogVisible.value = true;
+                    submitting.value = false;
+                };
+
+                // Submit Add History
+                const submitAddHistory = async () => {
+                    const form = addHistoryForm.value;
+                    
+                    // Validate required fields
+                    if (!form.renewDate || !form.startDate || !form.endDate) {
+                        ElMessage.error(lang.value === 'zh' ? '请填写完整的日期信息' : 'Please fill in all date fields');
+                        return;
+                    }
+                    
+                    // Check for period overlap
+                    const overlapResult = checkPeriodOverlap(form.startDate, form.endDate);
+                    if (overlapResult.overlap) {
+                        const existRecord = overlapResult.record;
+                        ElMessage.warning(lang.value === 'zh' 
+                            ? '账单周期与已有记录重叠 (' + existRecord.startDate + ' ~ ' + existRecord.endDate + ')，请修改已有记录而非添加新记录'
+                            : 'Period overlaps with existing record (' + existRecord.startDate + ' ~ ' + existRecord.endDate + '). Please edit the existing record instead.'
+                        );
+                        return;
+                    }
+                    
+                    // Add record
+                    const newRecord = {
+                        renewDate: form.renewDate,
+                        startDate: form.startDate,
+                        endDate: form.endDate,
+                        price: form.price,
+                        currency: form.currency,
+                        note: form.note
+                    };
+                    currentHistoryItem.value.renewHistory.unshift(newRecord);
+                    
+                    // Sync and save
+                    const realRow = list.value.find(i => i.id === currentHistoryItem.value.id);
+                    if (realRow) {
+                        realRow.renewHistory = currentHistoryItem.value.renewHistory;
+                        await saveData(null, null, true);
+                    }
+                    
+                    addHistoryDialogVisible.value = false;
+                    historyPage.value = 1;
+                };
+                const removeHistoryRecord = async (index) => {
+                    const realIndex = (historyPage.value - 1) * historyPageSize.value + index;
+                    currentHistoryItem.value.renewHistory.splice(realIndex, 1);
+                    // Sync to main list and persist
+                    const realRow = list.value.find(i => i.id === currentHistoryItem.value.id);
+                    if (realRow) {
+                        realRow.renewHistory = currentHistoryItem.value.renewHistory;
+                        await saveData(null, null, true);
+                    }
+                };
+
+
+                const historyStats = computed(() => {
+                    const hist = currentHistoryItem.value.renewHistory || [];
+                    const count = hist.length;
+                    const preferredCurrency = settings.value.defaultCurrency || 'CNY';
+                    
+                    // Group by currency
+                    const byCurrency = {};
+                    hist.forEach(item => {
+                        const cur = item.currency || 'CNY';
+                        const price = Number(item.price) || 0;
+                        byCurrency[cur] = (byCurrency[cur] || 0) + price;
+                    });
+                    
+                    // Convert to preferred currency
+                    let convertedTotal = 0;
+                    const rates = exchangeRates.value;
+                    Object.keys(byCurrency).forEach(cur => {
+                        const amount = byCurrency[cur];
+                        if (cur === preferredCurrency) {
+                            convertedTotal += amount;
+                        } else if (rates[cur]) {
+                            // rates 是以 preferredCurrency 为基准的
+                            // 所以 amount / rates[cur] = 换算后的 preferredCurrency 金额
+                            convertedTotal += amount / rates[cur];
+                        } else {
+                            // 无汇率时直接累加（近似）
+                            convertedTotal += amount;
+                        }
+                    });
+                    
+                    return { 
+                        count, 
+                        byCurrency, 
+                        convertedTotal: convertedTotal.toFixed(2), 
+                        preferredCurrency 
+                    };
+                });
+
 
                 const previewData = computed(() => {
                     const { lastRenewDate, intervalDays, cycleUnit, useLunar } = form.value;
@@ -2862,6 +4506,40 @@ const HTML = `<!DOCTYPE html>
                     }
                 });
 
+                const getSummaries = (param) => {
+                    const { columns } = param;
+                    const sums = [];
+                    const sourceData = filteredList.value; // Use filtered list for total
+                    const defaultCur = settings.value.defaultCurrency || 'CNY';
+                    const rates = exchangeRates.value || {};
+
+                    columns.forEach((column, index) => {
+                        if (index === 0) {
+                            sums[index] = t('totalCost');
+                            return;
+                        }
+                        if (column.property === 'fixedPrice') {
+                            let total = 0;
+                            sourceData.forEach(item => {
+                                const price = parseFloat(item.fixedPrice) || 0;
+                                const cur = item.currency || defaultCur;
+                                if (cur === defaultCur) {
+                                    total += price;
+                                } else if (rates[cur]) {
+                                    total += price / rates[cur];
+                                } else {
+                                    total += price; // Fallback
+                                }
+                            });
+                            sums[index] = '≈ ' + total.toFixed(2) + ' ' + defaultCur;
+                        } else {
+                            sums[index] = '';
+                        }
+                    });
+
+                    return sums;
+                };
+
                 const pagedList = computed(() => {
                     const start = (currentPage.value - 1) * pageSize.value;
                     const end = start + pageSize.value;
@@ -2870,6 +4548,27 @@ const HTML = `<!DOCTYPE html>
 
                 watch([currentTag, searchKeyword], () => {
                     currentPage.value = 1;
+                });
+                
+                // Initialize selectedMonth to the latest month when data is available
+                watch(() => spendingStats.value, (stats) => {
+                    if (stats.hasData && !selectedMonth.value) {
+                        const trends = stats[spendingMode.value]?.trends;
+                        if (trends && trends.length > 0) {
+                            selectedMonth.value = trends[trends.length - 1].month;
+                        }
+                    }
+                }, { immediate: true });
+                
+                // Reset selectedMonth when spendingMode or selectedYear changes
+                watch([spendingMode, selectedYear], () => {
+                    const stats = spendingStats.value;
+                    if (stats.hasData) {
+                        const trends = stats[spendingMode.value]?.trends;
+                        if (trends && trends.length > 0) {
+                            selectedMonth.value = trends[trends.length - 1].month;
+                        }
+                    }
                 });
                 const importRef = ref(null);
                 const exportData = async () => {
@@ -2901,20 +4600,33 @@ const HTML = `<!DOCTYPE html>
                     reader.readAsText(file);
                 };
                 return {
-                    tableKey, termRef, isLoggedIn, password, login, logout, loading, list, settings, lang, toggleLang, setLang, t, locale, disabledCount,
+                    tableKey, termRef, isLoggedIn, password, login, logout, loading, list, settings, lang, toggleLang, setLang, t, locale, disabledCount, currentView, hoverIndex, spendingStats, spendingMode, selectedYear, selectedMonth, monthDetails, Close: ElementPlusIconsVue.Close,
                     dialogVisible, settingsVisible, historyVisible, historyLoading, historyLogs, checking, logs, displayLogs, form, settingsForm, isEdit,
-                    expiringCount, expiredCount, currentTag, allTags, filteredList, searchKeyword, logVisible,formatLogTime,Upload, Download,
+                    expiringCount, expiredCount, currentTag, allTags, filteredList, upcoming7DaysBills, upcoming7DaysTotal, searchKeyword, logVisible,formatLogTime,Upload, Download,
                     openAdd, editItem, deleteItem, saveItem, openSettings, saveSettings, runCheck, openHistoryLogs, clearLogs, toggleEnable,importRef, exportData, triggerImport, handleImportFile,
-                    Edit, Delete, Plus, VideoPlay, Setting, Bell, Document, Lock, Monitor, SwitchButton, Calendar, Timer, Files, AlarmClock, Warning, Search, Cpu, Link, Message, Promotion, Iphone, Moon, Sunny, ArrowDown,
+                    Edit, Delete, Plus, VideoPlay, Setting, Bell, Document, Lock, Monitor, SwitchButton, Calendar, Timer, Files, AlarmClock, Warning, Search, Cpu, Link, Connection, Message, Promotion, Iphone, Moon, Sunny, ArrowDown, Tickets,
                     getDaysClass, formatDaysLeft, getTagClass, getLogColor, getLunarStr, getYearGanZhi, getSmartLunarText, getLunarTooltip, getMonthStr, getTagCount, tableRowClassName, channelMap, toggleChannel, testChannel, testing,
                     expandedChannels,
-                    calendarUrl, copyIcsUrl, resetCalendarToken,manualRenew,RefreshRight,timezoneList,currentPage, pageSize, pagedList, previewData,
+                    calendarUrl, copyIcsUrl, resetCalendarToken, migrateOldData, manualRenew,RefreshRight,timezoneList,currentPage, pageSize, pagedList, previewData,
                     isDark, toggleTheme, drawerSize, actionColWidth, paginationLayout, confirmDelete, confirmRenew, More, windowWidth,
                     handleSortChange, handleFilterChange, 
-                    nextDueFilters, typeFilters, uptimeFilters, lastRenewFilters
+                    nextDueFilters, typeFilters, uptimeFilters, lastRenewFilters,
+                    currencyList,editingHistoryIndex, tempHistoryItem, startEditHistory, cancelEditHistory, saveEditHistory,
+                    Money: ElementPlusIconsVue.Money || ElementPlusIconsVue.Coin, // 如果没有 Money 图标，用 Coin 代替
+                    renewDialogVisible, renewMode, renewForm, openRenew, submitRenew,
+                    historyDialogVisible, currentHistoryItem, historyPage, historyPageSize, pagedHistory, openHistory, saveHistoryInfo, addHistoryRecord, removeHistoryRecord, historyStats, exchangeRates, ratesLoading,
+                    addHistoryDialogVisible, addHistoryForm, submitAddHistory,
+                    editingHistoryIndex, tempHistoryItem, startEditHistory, saveEditHistory, cancelEditHistory, submitting, currentRenewItem,
+                    getSummaries, expiringTotal, expiredTotal, totalAmount
                 };
             }
-        }).use(ElementPlus).mount('#app');
+        });
+        
+        app.use(ElementPlus);
+        for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+            app.component(key, component);
+        }
+        app.mount('#app');
     </script>
 </body>
 </html>`;
