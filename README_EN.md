@@ -6,11 +6,11 @@
 ![Vue.js](https://img.shields.io/badge/Frontend-Vue3%20%2B%20ElementPlus-42b883?logo=vue.js)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-**RenewHelper** is a full-stack service lifecycle reminder and management tool based on **Cloudflare Workers**. It is designed to manage periodic subscriptions, domain renewals, server expirations, and more. It requires no server (Serverless), incurs zero hosting costs, and features a stunning Mecha-style UI, a powerful Lunar/Solar calendar core, multi-channel notifications, and iCal schedule synchronization. **v1.3.5+ now supports both Worker and Docker deployments.**
+**RenewHelper** is a full-stack service lifecycle reminder and management tool based on **Cloudflare Workers**. It is designed to manage periodic subscriptions, domain renewals, server expirations, and more. It requires no server (Serverless), incurs zero hosting costs, and features a stunning Mecha-style UI, a powerful Lunar/Solar calendar core, multi-channel notifications, and iCal schedule synchronization. **It supports both Worker and Docker deployments. v2.x introduces a cash flow dashboard with comprehensive billing management features.**
 
 <div align="center">
-  <img src="./assets/mainUI_darkEN_shot.png" alt="RenewHelper 界面预览" width="800">
-  <img src="./assets/mainUI_lightCN_shot.png" alt="RenewHelper 界面预览" width="800"> 
+  <img src="./assets/mainUI_lightEN_shotv2.png" alt="RenewHelper 界面预览" width="800">
+  <img src="./assets/DashboardUI_lightEN.png" alt="RenewHelper 界面预览" width="800"> 
 </div>
 
 ## ✨ Key Features
@@ -22,8 +22,13 @@
   - Supports automatic calculation based on Day, Month, or Year intervals.
   - Two modes: "Cycle Subscription" (Repeating) and "Expiration Reset" (Manual extension).
 - **🔔 Multi-Channel Notifications**:
-  - Built-in support for **Telegram, Bark, PushPlus, NotifyX, Resend (Email), and Webhook**.
+  - Built-in support for **Telegram, Bark, PushPlus, NotifyX, Resend (Email), Gotify, Ntfy, Webhook (x3)**.
   - Customizable advance notice days and daily push times.
+- **💰 Billing & Spending Dashboard** (New v2.0+):
+  - Stunning visualization of your spending trends by month and year.
+  - **Multi-currency** support with automatic exchange rate conversion.
+  - Distinguish between **Bill Amount** (Budget) and **Actual Cost** (Paid).
+  - Preview upcoming bills for the next n days.
 - **🤖 Automation**:
   - **Auto-Renew**: Automatically updates the next due date upon expiration.
   - **Auto-Disable**: Automatically marks services as disabled if they are overdue for too long.
@@ -279,7 +284,7 @@ After deployment, visit your Worker URL or custom domain (e.g., `https://renewhe
     - **Master Notification Switch**: Enable to configure specific notification channels.
 
 <div align="center">
-  <img src="./assets/configUIhelp_darkEN_shot.png" alt="RenewHelper 界面预览" width="800">
+  <img src="./assets/configUI_lightEN_shotv2.png" alt="RenewHelper 界面预览" width="800">
 </div>
 
 ### 📢 Notification Channels
@@ -293,7 +298,9 @@ Configure these in "Settings" -> "Notifications":
 | **PushPlus**       | **Token**: User Token                                                       | 1. Visit [PushPlus Official Site](https://www.pushplus.plus/).<br>2. Login via WeChat to get your Token.                                                                                                                                                 |
 | **NotifyX**        | **API Key**: Key                                                            | 1. Visit [NotifyX Official Site](https://www.notifyx.cn/).<br>2. Login to get your API Key.                                                                                                                                                              |
 | **Resend** (Email) | **API Key**: Resend Key<br>**From**: Sender Email<br>**To**: Receiver Email | 1. Register at [Resend](https://resend.com/).<br>2. Bind a domain and get an API Key.<br>3. `From` must be a verified domain email (e.g., `alert@yourdomain.com`). If you don't have one, use `onboarding@resend.dev` and send to your registered email. |
-| **Webhook**        | **URL**: POST URL                                                           | For custom development. The system sends a POST request: `{ "title": "...", "content": "..." }`. [Webhook Configuration Guide](./webhook_guide_en.md)                                                                                                                                                        |
+| **Gotify**         | **Server**: URL<br>**Token**: App Token                                     | Self-hosted Gotify server. Create an Application to get the Token.                                                                                                                                                                                                       |
+| **Ntfy**           | **Server**: URL (Def: ntfy.sh)<br>**Topic**: Topic<br>**Token**: Token      | 1. **Server**: Leave empty for default `https://ntfy.sh`.<br>2. **Topic**: The topic name you subscribed to.<br>3. **Token**: (Optional) Required if your topic is protected.                                                                                          |
+| **Webhook**        | **URL**: POST URL                                                           | For custom development. Supports **3** Webhooks. The system sends a POST request: `{ "title": "...", "content": "..." }`. [Webhook Configuration Guide](./webhook_guide_en.md)                                                                                                                                                        |
 
 ---
 
@@ -329,6 +336,44 @@ Find the **Calendar Subscription** section in "Settings".
 4.  **Outlook**: Add Calendar -> Subscribe from web.
 5.  **Note**: The link contains a security token. Do not share it. If leaked, click "Reset Token".
 
+### 💰 Billing & Spending Dashboard
+
+Click the toggle button at the bottom of the main interface to enter the **Spending Dashboard**:
+
+1.  **Monthly Trends**: View spending curves for the past 12 months.
+2.  **Annual Summary**: View total spending for the last 3 years.
+3.  **Bill vs. Actual**:
+    - **Bill Amount**: Calculated based on the "Fixed Price" setting of your services.
+    - **Actual Cost**: Calculated based on the actual amount recorded in renewal history.
+4.  **Multi-Currency**: The system automatically queries real-time exchange rates to convert all currencies into your "Default Currency" for aggregated display.
+
+### 📜 History Records
+
+1.  **Renew**: Best for current renewal. The system automatically calculates the next start/end date based on the previous cycle.
+2.  **Add History**: Best for backfilling past records. Switch to "Add History Mode" to manually insert billing records for any time period.
+3.  **Edit History**: Click the "History" button on the right side to view and correct details (Price, Date, Note) of every past transaction.
+
+### 💾 Data Migration
+
+The system supports full data import/export for backup or migration purposes.
+
+1.  **Export**: Click "Export Data" in the top-right menu and download the `.json` backup file via the secure link.
+    *   *Includes: All services, renewal history, system settings.*
+    *   *Excludes: Sensitive JWT Secret (New system's secret is preserved upon import).*
+2.  **Import**: Find the "Import Data" section at the bottom of "Settings", paste the content of your backup file, and submit.
+    *   *Note: Import is **OVERWRITING**. It is recommended to backup current data before importing.*
+
+### 🔄 Migrate from Older Versions
+
+If you are upgrading from v1.x to v2.x, the data structure is backward compatible.
+
+1.  **Export** data from the old version to get the `.json` file.
+2.  Deploy the new version of the Worker (overwrite `_worker.js`).
+3.  **Import** the backup file in the new version.
+4.  The system automatically recognizes and adapts old data; missing fields (e.g., currency, history) will be filled with default values.
+
+
+
 ---
 
 ## ⚠️ Notes
@@ -363,4 +408,4 @@ If RenewHelper helps you, consider buying the author a coffee ☕️. Your suppo
 ---
 
 **License**: MIT
-Copyright (c) 2025 LOSTFREE
+Copyright (c) 2025-2026 LOSTFREE
