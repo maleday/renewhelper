@@ -27,6 +27,17 @@ services:
     depends_on:
       - renew-helper
 
+  # 若需自动更新保留以下watchtower配置
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 86400 --cleanup
+    environment:
+      - TZ=Asia/Shanghai
+
 volumes:
   caddy_data:
   caddy_config:

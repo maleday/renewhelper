@@ -3,7 +3,7 @@ name: Build Docker Image
 on:
   push:
     tags: [ "v*.*.*" ]
-    branches: [ "main" ]
+
 
 jobs:
   build:
@@ -27,8 +27,6 @@ jobs:
         with:
           images: ieax/renewhelper
           tags: |
-            # 规则1：如果是推送到 main 分支，生成 :main 标签，但不打 :latest
-            type=ref,event=branch
             # 规则2：如果是推送 tag (v1.0.0)，生成 :v1.0.0 标签
             type=ref,event=tag
             # 规则3：如果是推送 tag，自动生成 :latest 标签

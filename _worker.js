@@ -1,13 +1,14 @@
 /**
- * Cloudflare Worker: RenewHelper (v2.0.18)
+ * Cloudflare Worker: RenewHelper (v2.0.20)
  * Author: LOSTFREE
  * Features: Multi-Channel Notify, Import/Export, Channel Test, Bilingual UI, Precise ICS Alarm，Bill Management.
  * See CHANGELOG.md for history.
  */
 
-const APP_VERSION = "v2.0.18";
+const APP_VERSION = "v2.0.20";
 //接入免费汇率API
 const EXCHANGE_RATE_API_URL = 'https://api.frankfurter.dev/v1/latest?base=';
+
 // ==========================================
 // 1. Core Logic (Lunar & Calc)
 // ==========================================
@@ -1220,6 +1221,35 @@ app.get(
         return response({ code: 200, data: await DataStore.getLogs(env) });
     })
 );
+
+app.get(
+    "/api/rates",
+    withAuth(async (req, env) => {
+        const url = new URL(req.url);
+        const base = url.searchParams.get("base") || "CNY";
+        const cacheKey = "RATES_" + base;
+
+        // 1. Try KV Cache
+        const cached = await env.RENEW_KV.get(cacheKey, { type: "json" });
+        if (cached && cached.ts && (Date.now() - cached.ts < 86400000)) { // 24h
+            return response(cached.data);
+        }
+
+        // 2. Fetch Upstream
+        try {
+            const res = await fetch(EXCHANGE_RATE_API_URL + base);
+            if (!res.ok) throw new Error("Upstream API Error");
+            const data = await res.json();
+
+            // 3. Cache Result
+            await env.RENEW_KV.put(cacheKey, JSON.stringify({ ts: Date.now(), data }), { expirationTtl: 86400 });
+
+            return response(data);
+        } catch (e) {
+            return error("RATE_FETCH_FAILED", 502);
+        }
+    })
+);
 app.post(
     "/api/logs/clear",
     withAuth(async (req, env) => {
@@ -2228,7 +2258,7 @@ const HTML = `<!DOCTYPE html>
                                       style="animation-delay: 0.2s; min-height: 380px;">
                                      <div class="flex justify-between items-center mb-6">
                                          <div class="text-xs font-bold font-mono tracking-widest uppercase">{{ t('annualSummary') }}</div>
-                                         <el-icon class="text-gray-400"><Promotion /></el-icon>
+                                         <el-icon class="text-gray-400"><component :is="Money" /></el-icon>
                                      </div>
                                      
                                      <!-- Selected Period Big Number -->
@@ -4034,7 +4064,7 @@ const HTML = `<!DOCTYPE html>
 
                     ratesLoading.value = true;
                     try {
-                        const res = await fetch('${EXCHANGE_RATE_API_URL}'+baseCurrency);
+                        const res = await fetch('/api/rates?base='+baseCurrency, { headers: getAuth() });
                         if (res.ok) {
                             const data = await res.json();
                             const rates = { ...data.rates, [baseCurrency]: 1 };
@@ -4595,7 +4625,7 @@ const HTML = `<!DOCTYPE html>
                     handleSortChange, handleFilterChange, 
                     nextDueFilters, typeFilters, uptimeFilters, lastRenewFilters,
                     currencyList,editingHistoryIndex, tempHistoryItem, startEditHistory, cancelEditHistory, saveEditHistory,
-                    Money: ElementPlusIconsVue.Money || ElementPlusIconsVue.Coin, // 如果没有 Money 图标，用 Coin 代替
+                    Money: ElementPlusIconsVue.Coin, 
                     renewDialogVisible, renewMode, renewForm, openRenew, submitRenew,
                     historyDialogVisible, currentHistoryItem, historyPage, historyPageSize, pagedHistory, openHistory, saveHistoryInfo, addHistoryRecord, removeHistoryRecord, historyStats, exchangeRates, ratesLoading,
                     addHistoryDialogVisible, addHistoryForm, submitAddHistory,

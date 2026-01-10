@@ -28,4 +28,6 @@
 - 2026-01-07: added: add icon and custom push title config v2.0.15
 - 2026-01-08: modified: fix filter logic v2.0.16
 - 2026-01-08: modified: fix spending stats UI logic v2.0.17
-- 2026-01-08: modified: fix infinite loop logic v2.0.18
+- 2026-01-08: modified: fix UI bugs, infinite loop risk, update docs v2.0.18
+- 2026-01-08: hotfix: emergency fix v2.0.19
+- 2026-01-09: added: exchange rate proxy, kv cache, auto-sync workflow, watchtower support v2.0.20
